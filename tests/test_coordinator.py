@@ -252,7 +252,7 @@ def test_reads_complete_register_block(
     )
 
 
-def test_delegates_connection_and_decodes_raw_data(
+def test_gets_and_decodes_raw_data(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     block = SimpleNamespace(
@@ -266,7 +266,7 @@ def test_delegates_connection_and_decodes_raw_data(
     monkeypatch.setitem(coordinator_module.MOD_REGISTER_MAP, "blocks", (block,))
     decode_register = Mock(side_effect=(2.0, 42.0))
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
-    coordinator._client = SimpleNamespace(connected=False)
+    coordinator._client = SimpleNamespace(connected=True)
     coordinator.async_read_block = AsyncMock(return_value=[2, 42])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
 
@@ -274,6 +274,35 @@ def test_delegates_connection_and_decodes_raw_data(
 
     assert result == {"battery_count": 2.0, "grid_power": 42.0}
     coordinator.async_read_block.assert_awaited_once_with(100, 2)
+
+
+def test_raw_data_raises_when_reconnect_fails(coordinator) -> None:
+    coordinator._client = SimpleNamespace(connected=False)
+    coordinator.async_reconnect = AsyncMock(return_value=False)
+
+    with pytest.raises(coordinator_module.UpdateFailed, match="Reconnect failed"):
+        asyncio.run(coordinator.async_get_raw_data())
+
+
+def test_reconnect_succeeds_on_later_attempt(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.serial_number = "SN"
+    monkeypatch.setattr(coordinator_module.asyncio, "sleep", AsyncMock())
+    coordinator._client = SimpleNamespace(
+        connected=True,
+        connect=AsyncMock(side_effect=[False, True]),
+        close=Mock(),
+    )
+
+    async def reconnect():
+        coordinator._lock = asyncio.Lock()
+        return await coordinator.async_reconnect()
+
+    assert asyncio.run(reconnect()) is True
+    assert coordinator._client.connect.await_count == 2
+    coordinator._client.close.assert_called_once_with()
+
 
 
 @pytest.mark.parametrize(

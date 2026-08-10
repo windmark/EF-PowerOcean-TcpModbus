@@ -46,7 +46,7 @@ from .telemetry import TelemetryData, calculate_derived_values, decode_register
 _LOGGER = logging.getLogger(__name__)
 
 MODBUS_TIMEOUT: Final = 20
-MODBUS_RETRIES: Final = 2
+SLEEP_TIME_AFTER_RECONNECT: Final = 1
 MODBUS_EXCEPTION_NAMES: Final = {
     2: "IllegalAddress",
     4: "SlaveFailure",
@@ -102,7 +102,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             host=self.host,
             port=self.port,
             timeout=MODBUS_TIMEOUT,
-            retries=MODBUS_RETRIES,
+            reconnect_delay=0,
+            retries=0,
         )
         self._client_slave_id = DEFAULT_SLAVE
         self._lock = asyncio.Lock()
@@ -123,8 +124,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         await super().async_shutdown()
 
     async def async_connect_client(self) -> None:
-        """Read connection metadata after the first successful refresh."""
+        """First client connect and read connection metadata."""
+        await self._client.connect()
+
         if not self._client.connected:
+            _LOGGER.error("Modbus TCP not connected to %s:%s", self.host, self.port)
             return
 
         self.serial_number = await self.async_get_serial_number()
@@ -146,6 +150,35 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         sn = "".join(chr((r >> 8) & 0xFF) + chr(r & 0xFF) for r in raw)
         return sn.strip().replace("\x00", "")
+
+    async def async_reconnect(self) -> bool:
+        """Client-Reconnect"""
+        delays = [0, 5, 30, 120]
+        _LOGGER.debug(
+            f"PowerOcean (SN: {self.serial_number}) is not connected. Start reconnect!"
+        )
+
+        for i, delay in enumerate(delays):
+            async with self._lock:
+                if delay > 0:
+                    _LOGGER.debug(
+                        f"Reconnect failed! Wait {delay}s until next attempt."
+                    )
+                    await asyncio.sleep(delay)
+
+                _LOGGER.debug(f"Modbus TCP reconnect (Attempt {i + 1}/4)...")
+                if await self._client.connect() and self._client.connected:
+                    _LOGGER.debug(
+                        f"Reconnect successful! (SN: {self.serial_number}) Atempts: {i + 1}/4"
+                    )
+                    await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT)
+                    return True
+                self._client.close()
+
+        _LOGGER.error(
+            "EF-Modbus-TCP: All reconnect attempts failed! \u2013 will retry next poll"
+        )
+        return False
 
     async def async_read_block(self, addr: int, count: int) -> list[int]:
         """Read a complete block of holding registers."""
@@ -171,6 +204,10 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
+
+        # Reconnect if the connection dropped since the last poll.
+        if not self._client.connected and not await self.async_reconnect():
+            raise UpdateFailed("Reconnect failed!")
 
         try:
             # Read all register blocks
