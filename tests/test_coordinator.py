@@ -271,7 +271,7 @@ def test_reads_register_block(coordinator, is_error: bool) -> None:
     )
 
 
-def test_gets_and_decodes_raw_data(
+def test_delegates_connection_and_decodes_raw_data(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     block = SimpleNamespace(
@@ -285,7 +285,7 @@ def test_gets_and_decodes_raw_data(
     monkeypatch.setitem(coordinator_module.MOD_REGISTER_MAP, "blocks", (block,))
     decode_register = Mock(side_effect=(2.0, 42.0))
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
-    coordinator._client = SimpleNamespace(connected=True)
+    coordinator._client = SimpleNamespace(connected=False)
     coordinator.async_read_block = AsyncMock(return_value=[2, 42])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
 
@@ -295,9 +295,61 @@ def test_gets_and_decodes_raw_data(
     coordinator.async_read_block.assert_awaited_once_with(100, 2)
 
 
-def test_raw_data_raises_when_reconnect_fails(coordinator) -> None:
-    coordinator._client = SimpleNamespace(connected=False)
-    coordinator.async_reconnect = AsyncMock(return_value=False)
+@pytest.mark.parametrize(
+    ("error", "message"),
+    (
+        (coordinator_module.ModbusException("timed out"), "communication failed"),
+        (OSError("network down"), "connection failed"),
+        (asyncio.TimeoutError(), "connection failed"),
+    ),
+    ids=("modbus", "network", "timeout"),
+)
+def test_raw_data_closes_connection_and_raises_on_transport_failure(
+    coordinator, error: Exception, message: str
+) -> None:
+    coordinator._client = SimpleNamespace(connected=True, close=Mock())
+    coordinator.async_read_block = AsyncMock(side_effect=error)
 
-    with pytest.raises(coordinator_module.UpdateFailed, match="Reconnect failed"):
+    with pytest.raises(coordinator_module.UpdateFailed, match=message):
         asyncio.run(coordinator.async_get_raw_data())
+
+    coordinator._client.close.assert_called_once_with()
+
+
+def test_raw_data_rejects_inconsistent_battery_count(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = SimpleNamespace(
+        start_register=100,
+        num_read_regs=1,
+        content=(SimpleNamespace(key="battery_count", block_index=0, size=1),),
+    )
+    monkeypatch.setitem(coordinator_module.MOD_REGISTER_MAP, "blocks", (block,))
+    monkeypatch.setattr(coordinator_module, "decode_register", Mock(return_value=1))
+    coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_read_block = AsyncMock(return_value=[1])
+    coordinator.limits[const.CONF_BATTERY_COUNT] = 2
+
+    with pytest.raises(coordinator_module.UpdateFailed, match="inconsistent battery"):
+        asyncio.run(coordinator.async_get_raw_data())
+
+
+def test_update_propagates_connection_failure(coordinator) -> None:
+    coordinator.async_get_raw_data = AsyncMock(
+        side_effect=coordinator_module.UpdateFailed("connection lost")
+    )
+
+    with pytest.raises(coordinator_module.UpdateFailed, match="connection lost"):
+        asyncio.run(coordinator._async_update_data())
+
+
+def test_serial_number_failure_is_best_effort(coordinator) -> None:
+    coordinator._client = SimpleNamespace(close=Mock())
+    coordinator.async_read_block = AsyncMock(
+        side_effect=coordinator_module.ModbusException("timed out")
+    )
+
+    result = asyncio.run(coordinator.async_get_serial_number())
+
+    assert result == "unknown"
+    coordinator._client.close.assert_called_once_with()

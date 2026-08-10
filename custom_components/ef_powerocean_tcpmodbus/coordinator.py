@@ -45,8 +45,8 @@ from .telemetry import TelemetryData, calculate_derived_values, decode_register
 
 _LOGGER = logging.getLogger(__name__)
 
-SLEEP_TIME_AFTER_RECONNECT: Final = 1
-SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED: Final = 15
+MODBUS_TIMEOUT: Final = 20
+MODBUS_RETRIES: Final = 2
 
 
 class EcoflowCoordinator(DataUpdateCoordinator):
@@ -94,7 +94,10 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         self.serial_number: str | None = None
         self._client: AsyncModbusTcpClient = AsyncModbusTcpClient(
-            host=self.host, port=self.port, timeout=20, reconnect_delay=0, retries=0
+            host=self.host,
+            port=self.port,
+            timeout=MODBUS_TIMEOUT,
+            retries=MODBUS_RETRIES,
         )
         self._client_slave_id = DEFAULT_SLAVE
         self._lock = asyncio.Lock()
@@ -121,16 +124,16 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         await super().async_shutdown()
 
     async def async_connect_client(self) -> None:
-        """First Client-Connect"""
-        await self._client.connect()
-
+        """Read connection metadata after the first successful refresh."""
         if not self._client.connected:
-            _LOGGER.error(f"Modbus TCP not connected to {self.host}:{self.port}")
             return
 
         self.serial_number = await self.async_get_serial_number()
         _LOGGER.info(
-            f"Modbus TCP is connected to {self.host}:{self.port} (SN: {self.serial_number})"
+            "Modbus TCP is connected to %s:%s (SN: %s)",
+            self.host,
+            self.port,
+            self.serial_number,
         )
 
     async def async_get_serial_number(self) -> str:
@@ -138,41 +141,12 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         try:
             raw = await self.async_read_block(MOD_REGISTER_MAP["serial_number"], 8)
         except ModbusException as err:
-            _LOGGER.error(f"Can not read serial number. {err.string}.")
+            _LOGGER.debug("Cannot read serial number: %s", err)
             self._client.close()
             return "unknown"
 
         sn = "".join(chr((r >> 8) & 0xFF) + chr(r & 0xFF) for r in raw)
         return sn.strip().replace("\x00", "")
-
-    async def async_reconnect(self) -> bool:
-        """Client-Reconnect"""
-        delays = [0, 5, 30, 120]
-        _LOGGER.debug(
-            f"PowerOcean (SN: {self.serial_number}) is not connected. Start reconnect!"
-        )
-
-        for i, delay in enumerate(delays):
-            async with self._lock:
-                if delay > 0:
-                    _LOGGER.debug(
-                        f"Reconnect failed! Wait {delay}s until next attempt."
-                    )
-                    await asyncio.sleep(delay)
-
-                _LOGGER.debug(f"Modbus TCP reconnect (Attempt {i + 1}/4)...")
-                if await self._client.connect() and self._client.connected:
-                    _LOGGER.debug(
-                        f"Reconnect successful! (SN: {self.serial_number}) Atempts: {i + 1}/4"
-                    )
-                    await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT)
-                    return True
-                self._client.close()
-
-        _LOGGER.error(
-            "EF-Modbus-TCP: All reconnect attempts failed! – will retry next poll"
-        )
-        return False
 
     async def async_read_block(self, addr: int, count: int) -> list[int] | None:
         """Read *count* holding registers starting at *addr*.  Returns None on error."""
@@ -190,10 +164,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
 
-        # ── Check Connection, if not -> start reconnection ──
-        if not self._client.connected and not await self.async_reconnect():
-            raise UpdateFailed("Reconnect failed!")
-
         try:
             # Read all register blocks
             for register_block in MOD_REGISTER_MAP["blocks"]:
@@ -207,20 +177,21 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                     data[register.key] = decode_value
 
             if data["battery_count"] != self.limits[CONF_BATTERY_COUNT]:
-                _LOGGER.debug(
-                    f"Read battery count {data['battery_count']} is unequal -> Skip data! Wait {SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED}s."
+                raise UpdateFailed(
+                    "Received inconsistent battery count "
+                    f"{data['battery_count']} (expected "
+                    f"{self.limits[CONF_BATTERY_COUNT]})"
                 )
-                await asyncio.sleep(SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED)
-                return None
 
             return data
         except ModbusException as err:
-            _LOGGER.debug(f"{err.string}. Connection closing...")
             self._client.close()
-            return None
-        except Exception as err:
-            _LOGGER.error(f"Unexpected error during data fetch: {repr(err)}")
-            return data
+            raise UpdateFailed(f"Modbus communication failed: {err}") from err
+        except UpdateFailed:
+            raise
+        except (OSError, asyncio.TimeoutError) as err:
+            self._client.close()
+            raise UpdateFailed(f"Modbus connection failed: {err}") from err
 
     def _sanitize_energy_values(self, data: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = dict(data)
@@ -307,35 +278,25 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return data
 
     async def _async_update_data(self) -> dict[str, Any]:
-        try:
-            if (raw_data := await self.async_get_raw_data()) is None:
-                return None
+        raw_data = await self.async_get_raw_data()
 
-            result = self._sanitize_energy_values(raw_data)
-            calculated_results = calculate_derived_values(
-                TelemetryData.from_mapping(result),
-                calculate_solar_power=self._ena_calc_solar_power,
-                daily_reset_complete=(
-                    self._count_reset_energy_finished == self._count_reset_energy_sensor
-                ),
-                startup_voltage=self.inverter_model.startup_voltage,
-                max_battery_charge_power=MAX_BATTERY_CHARGED_POWER,
-                max_battery_discharge_power=MAX_BATTERY_DISCHARGED_POWER,
-            )
-            result.update(calculated_results)
+        result = self._sanitize_energy_values(raw_data)
+        calculated_results = calculate_derived_values(
+            TelemetryData.from_mapping(result),
+            calculate_solar_power=self._ena_calc_solar_power,
+            daily_reset_complete=(
+                self._count_reset_energy_finished == self._count_reset_energy_sensor
+            ),
+            startup_voltage=self.inverter_model.startup_voltage,
+            max_battery_charge_power=MAX_BATTERY_CHARGED_POWER,
+            max_battery_discharge_power=MAX_BATTERY_DISCHARGED_POWER,
+        )
+        result.update(calculated_results)
 
-            if self._check_monotonic:
-                result = self._enforced_monotonic(result)
+        if self._check_monotonic:
+            result = self._enforced_monotonic(result)
 
-            self._last_checked_data = dict(result)
-            self._last_checked_time = dt.now()
+        self._last_checked_data = dict(result)
+        self._last_checked_time = dt.now()
 
-            return dict(result)
-        except UpdateFailed:  # noqa: BLE001
-            raise UpdateFailed(
-                "Reconnect attempts failed! Integration stopped. Retry after 120s.",
-                retry_after=120,
-            )
-        except Exception as err:
-            _LOGGER.error(f"Unexpected error during data fetch: {repr(err)}")
-            return None
+        return dict(result)
