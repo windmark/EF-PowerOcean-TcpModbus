@@ -194,7 +194,12 @@ def test_rejects_daily_counter_decrease_within_same_date(
     assert result == coordinator._last_checked_data
 
 
-def test_enforces_monotonic_energy_values(coordinator) -> None:
+def test_enforces_monotonic_energy_values(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    coordinator._last_checked_time = now - timedelta(minutes=1)
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
     coordinator._last_checked_data = {
         "grid_import_total": 10.0,
         "grid_export_total": 5.0,
@@ -202,19 +207,35 @@ def test_enforces_monotonic_energy_values(coordinator) -> None:
     data = {
         "grid_import_total": 9.0,
         "grid_export_total": 6.0,
-        "grid_import_today": 0.0,
     }
-    coordinator._last_checked_data["grid_import_today"] = 2.0
 
     result = coordinator._enforced_monotonic(data)
 
     assert result is data
     assert result["grid_import_total"] == 10.0
     assert result["grid_export_total"] == 6.0
-    assert result["grid_import_today"] == 0.0
 
 
-def test_monotonic_allows_daily_house_energy_to_reset(coordinator) -> None:
+def test_monotonic_clamps_daily_energy_within_same_day(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    coordinator._last_checked_time = now - timedelta(minutes=1)
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
+    coordinator._last_checked_data = {"house_energy_today": 16.69}
+    data = {"house_energy_today": 16.68}
+
+    result = coordinator._enforced_monotonic(data)
+
+    assert result["house_energy_today"] == 16.69
+
+
+def test_monotonic_allows_daily_energy_reset_on_date_change(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 11, 0, 0, 5, tzinfo=timezone.utc)
+    coordinator._last_checked_time = now - timedelta(minutes=1)
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
     coordinator._last_checked_data = {"house_energy_today": 20.0}
     data = {"house_energy_today": 0.0}
 

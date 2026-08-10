@@ -349,13 +349,17 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return result
 
     def _enforced_monotonic(self, data: dict[str, Any]) -> dict[str, Any]:
-        for energy_senser in ENERGY_SENSOR_MAP:
-            if energy_senser.reset_at_midnight:
+        date_changed = (
+            self._last_checked_time is not None
+            and dt.now().date() != self._last_checked_time.date()
+        )
+        for energy_sensor in ENERGY_SENSOR_MAP:
+            if energy_sensor.reset_at_midnight and date_changed:
                 continue
-            last = self._last_checked_data.get(energy_senser.key, None)
-            current = data.get(energy_senser.key, None)
+            last = self._last_checked_data.get(energy_sensor.key, None)
+            current = data.get(energy_sensor.key, None)
             if last is not None and current is not None and current < last:
-                data[energy_senser.key] = last
+                data[energy_sensor.key] = last
 
         return data
 
