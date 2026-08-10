@@ -46,9 +46,9 @@ from .telemetry import TelemetryData, calculate_derived_values, decode_register
 
 _LOGGER = logging.getLogger(__name__)
 
-MODBUS_TIMEOUT: Final = 20
+MODBUS_TIMEOUT: Final = 5
 SLEEP_TIME_AFTER_RECONNECT: Final = 1
-RECONNECT_DELAYS: Final = (0, 5, 30, 120)
+RECONNECT_DELAYS: Final = (5, 30, 120)
 MODBUS_EXCEPTION_NAMES: Final = {
     2: "IllegalAddress",
     4: "SlaveFailure",
@@ -166,26 +166,40 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
     async def async_reconnect(self) -> bool:
         """Reconnect with escalating backoff; returns True on success."""
+        total_attempts = len(RECONNECT_DELAYS) + 1
         _LOGGER.debug(
-            f"PowerOcean (SN: {self.serial_number}) is not connected. Start reconnect!"
+            "PowerOcean (SN: %s) connection lost, attempting to reconnect",
+            self.serial_number,
         )
 
-        for delay in RECONNECT_DELAYS:
-            if delay:
-                _LOGGER.debug(f"Reconnect failed! Wait {delay}s until next attempt.")
-                await asyncio.sleep(delay)
-
+        for attempt in range(1, total_attempts + 1):
             if self._shutdown:
                 _LOGGER.debug("Reconnect aborted: integration is shutting down")
                 return False
 
             if await self._try_connect():
-                _LOGGER.debug(f"Reconnect successful! (SN: {self.serial_number})")
+                _LOGGER.debug(
+                    "Reconnect successful on attempt %d/%d (SN: %s)",
+                    attempt,
+                    total_attempts,
+                    self.serial_number,
+                )
                 await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT)
                 return True
 
-        _LOGGER.error(
-            "EF-Modbus-TCP: All reconnect attempts failed! \u2013 will retry next poll"
+            if attempt < total_attempts:
+                delay = RECONNECT_DELAYS[attempt - 1]
+                _LOGGER.debug(
+                    "Reconnect attempt %d/%d failed, retrying in %ds",
+                    attempt,
+                    total_attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+        _LOGGER.debug(
+            "All %d reconnect attempts failed - will retry next poll",
+            total_attempts,
         )
         return False
 
