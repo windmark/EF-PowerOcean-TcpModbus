@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from datetime import datetime, timedelta
 from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt
 from pymodbus import __version__ as pyModbusVersion
@@ -49,8 +47,6 @@ _LOGGER = logging.getLogger(__name__)
 
 MODBUS_TIMEOUT: Final = 20
 MODBUS_RETRIES: Final = 2
-STORAGE_VERSION: Final = 1
-STORAGE_SAVE_DELAY: Final = 300
 MODBUS_EXCEPTION_NAMES: Final = {
     2: "IllegalAddress",
     4: "SlaveFailure",
@@ -112,60 +108,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
-        self._energy_keys = {
-            sensor.key for sensor in ENERGY_SENSOR_MAP if not sensor.is_calculated
-        }
-        self._store: Store[dict[str, Any]] = Store(
-            hass,
-            STORAGE_VERSION,
-            f"{DOMAIN}.{config_entry.entry_id}.energy_history",
-        )
-
-    async def _async_setup(self) -> None:
-        """Restore energy validation history before the first refresh."""
-        stored = await self._store.async_load()
-        if not isinstance(stored, dict):
-            return
-
-        checked_at = stored.get("checked_at")
-        energy = stored.get("energy")
-        if not isinstance(checked_at, str) or not isinstance(energy, dict):
-            _LOGGER.warning("Ignoring invalid stored energy validation history")
-            return
-
-        try:
-            checked_time = dt.parse_datetime(checked_at)
-        except ValueError:
-            checked_time = None
-        now = dt.now()
-        if checked_time is None or checked_time.tzinfo is None or checked_time > now:
-            _LOGGER.warning("Ignoring invalid stored energy validation timestamp")
-            return
-
-        restored_energy = {
-            key: value
-            for key, value in energy.items()
-            if key in self._energy_keys
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-        }
-        if not restored_energy:
-            return
-
-        self._last_checked_data = restored_energy
-        self._last_checked_time = checked_time
-
-    def _energy_history_to_store(self) -> dict[str, Any]:
-        """Return the latest energy validation history for delayed storage."""
-        return {
-            "checked_at": self._last_checked_time.isoformat(),
-            "energy": {
-                key: self._last_checked_data[key]
-                for key in self._energy_keys
-                if key in self._last_checked_data
-            },
-        }
 
     @property
     def connected(self) -> bool:
@@ -177,8 +119,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_client_shutdown(self) -> None:
         """Integration-Shutdown, closing connection"""
         _LOGGER.info("PowerOcean Shutdown. Closing Connection!")
-        if self._last_checked_time is not None and self._last_checked_data:
-            await self._store.async_save(self._energy_history_to_store())
         self._client.close()
         await super().async_shutdown()
 
@@ -273,9 +213,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         result: dict[str, Any] = dict(data)
 
         now = dt.now()
-        if self._last_checked_time is None or self._last_checked_data is None:
+        if self._last_checked_time is None or not self._last_checked_data:
             _LOGGER.debug(
-                "Last checked time or last checked data is None. Return current data."
+                "No previous energy sample; using current data as validation baseline"
             )
             return result
 
@@ -369,6 +309,5 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         self._last_checked_data = dict(result)
         self._last_checked_time = dt.now()
-        self._store.async_delay_save(self._energy_history_to_store, STORAGE_SAVE_DELAY)
 
         return dict(result)

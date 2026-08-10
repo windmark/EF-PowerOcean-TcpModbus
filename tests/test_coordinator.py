@@ -19,14 +19,6 @@ def coordinator():
     )
     instance._last_checked_data = {}
     instance._last_checked_time = None
-    instance._energy_keys = {
-        sensor.key for sensor in const.ENERGY_SENSOR_MAP if not sensor.is_calculated
-    }
-    instance._store = SimpleNamespace(
-        async_load=AsyncMock(return_value=None),
-        async_save=AsyncMock(),
-        async_delay_save=Mock(),
-    )
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
         const.CONF_MAX_SOLAR_POWER: 12_000,
@@ -34,80 +26,6 @@ def coordinator():
         const.CONF_MAX_BATTERY_DISCHARGED_POWER: 6_600,
     }
     return instance
-
-
-def test_restores_valid_energy_history(
-    coordinator, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
-    checked_at = now - timedelta(minutes=5)
-    coordinator._store.async_load.return_value = {
-        "checked_at": checked_at.isoformat(),
-        "energy": {
-            "grid_import_total": 123.4,
-            "grid_import_today": 5,
-            "house_power": 900,
-            "grid_export_total": float("nan"),
-        },
-    }
-    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
-
-    asyncio.run(coordinator._async_setup())
-
-    assert coordinator._last_checked_time == checked_at
-    assert coordinator._last_checked_data == {
-        "grid_import_total": 123.4,
-        "grid_import_today": 5,
-    }
-
-
-@pytest.mark.parametrize(
-    "stored",
-    (
-        None,
-        {},
-        {"checked_at": "invalid", "energy": {"grid_import_total": 1.0}},
-        {
-            "checked_at": "2026-08-10T12:01:00+00:00",
-            "energy": {"grid_import_total": 1.0},
-        },
-        {"checked_at": "2026-08-10T11:59:00+00:00", "energy": {}},
-    ),
-    ids=("missing", "malformed", "bad-timestamp", "future", "empty-energy"),
-)
-def test_ignores_invalid_energy_history(
-    coordinator, monkeypatch: pytest.MonkeyPatch, stored: object
-) -> None:
-    coordinator._store.async_load.return_value = stored
-    monkeypatch.setattr(
-        coordinator_module.dt,
-        "now",
-        lambda: datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc),
-    )
-
-    asyncio.run(coordinator._async_setup())
-
-    assert coordinator._last_checked_time is None
-    assert coordinator._last_checked_data == {}
-
-
-def test_serializes_only_raw_energy_history(coordinator) -> None:
-    checked_at = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
-    coordinator._last_checked_time = checked_at
-    coordinator._last_checked_data = {
-        "grid_import_total": 123.4,
-        "grid_import_today": 5.0,
-        "house_energy_today": 8.0,
-        "house_power": 900,
-    }
-
-    assert coordinator._energy_history_to_store() == {
-        "checked_at": checked_at.isoformat(),
-        "energy": {
-            "grid_import_total": 123.4,
-            "grid_import_today": 5.0,
-        },
-    }
 
 
 def sanitize(
@@ -428,49 +346,6 @@ def test_update_failure_preserves_last_accepted_snapshot(coordinator) -> None:
 
     assert coordinator._last_checked_data == {"grid_import_today": 10.0}
     assert coordinator._last_checked_time is last_checked_time
-
-
-def test_successful_update_schedules_delayed_history_save(
-    coordinator, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
-    coordinator.async_get_raw_data = AsyncMock(return_value={"grid_import_total": 10.0})
-    coordinator._ena_calc_solar_power = False
-    coordinator.inverter_model = SimpleNamespace(startup_voltage=160)
-    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
-    monkeypatch.setattr(
-        coordinator_module, "calculate_derived_values", Mock(return_value={})
-    )
-
-    result = asyncio.run(coordinator._async_update_data())
-
-    assert result == {"grid_import_total": 10.0}
-    coordinator._store.async_delay_save.assert_called_once_with(
-        coordinator._energy_history_to_store,
-        coordinator_module.STORAGE_SAVE_DELAY,
-    )
-    save_callback = coordinator._store.async_delay_save.call_args.args[0]
-    assert save_callback() == {
-        "checked_at": now.isoformat(),
-        "energy": {"grid_import_total": 10.0},
-    }
-
-
-def test_shutdown_flushes_energy_history(coordinator) -> None:
-    checked_at = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
-    coordinator._last_checked_time = checked_at
-    coordinator._last_checked_data = {"grid_import_total": 10.0}
-    coordinator._client = SimpleNamespace(close=Mock())
-
-    asyncio.run(coordinator.async_client_shutdown())
-
-    coordinator._store.async_save.assert_awaited_once_with(
-        {
-            "checked_at": checked_at.isoformat(),
-            "energy": {"grid_import_total": 10.0},
-        }
-    )
-    coordinator._client.close.assert_called_once_with()
 
 
 def test_serial_number_failure_is_best_effort(coordinator) -> None:
