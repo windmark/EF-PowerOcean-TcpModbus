@@ -23,7 +23,9 @@ def coordinator():
         sensor.key for sensor in const.ENERGY_SENSOR_MAP if not sensor.is_calculated
     }
     instance._store = SimpleNamespace(
-        async_load=AsyncMock(return_value=None), async_delay_save=Mock()
+        async_load=AsyncMock(return_value=None),
+        async_save=AsyncMock(),
+        async_delay_save=Mock(),
     )
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
@@ -452,6 +454,23 @@ def test_successful_update_schedules_delayed_history_save(
         "checked_at": now.isoformat(),
         "energy": {"grid_import_total": 10.0},
     }
+
+
+def test_shutdown_flushes_energy_history(coordinator) -> None:
+    checked_at = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+    coordinator._last_checked_time = checked_at
+    coordinator._last_checked_data = {"grid_import_total": 10.0}
+    coordinator._client = SimpleNamespace(close=Mock())
+
+    asyncio.run(coordinator.async_client_shutdown())
+
+    coordinator._store.async_save.assert_awaited_once_with(
+        {
+            "checked_at": checked_at.isoformat(),
+            "energy": {"grid_import_total": 10.0},
+        }
+    )
+    coordinator._client.close.assert_called_once_with()
 
 
 def test_serial_number_failure_is_best_effort(coordinator) -> None:

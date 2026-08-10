@@ -177,6 +177,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_client_shutdown(self) -> None:
         """Integration-Shutdown, closing connection"""
         _LOGGER.info("PowerOcean Shutdown. Closing Connection!")
+        if self._last_checked_time is not None and self._last_checked_data:
+            await self._store.async_save(self._energy_history_to_store())
         self._client.close()
         await super().async_shutdown()
 

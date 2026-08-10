@@ -32,9 +32,14 @@ homeassistant_storage.Store = type("Store", (), {})
 homeassistant_update_coordinator = types.ModuleType(
     "homeassistant.helpers.update_coordinator"
 )
-homeassistant_update_coordinator.DataUpdateCoordinator = type(
-    "DataUpdateCoordinator", (), {}
-)
+
+
+class DataUpdateCoordinator:
+    async def async_shutdown(self) -> None:
+        pass
+
+
+homeassistant_update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
 
 
 class UpdateFailed(Exception):
