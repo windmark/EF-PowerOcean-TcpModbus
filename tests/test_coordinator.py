@@ -19,9 +19,6 @@ def coordinator():
     )
     instance._last_checked_data = {}
     instance._last_checked_time = None
-    instance._check_monotonic = True
-    instance._count_reset_energy_sensor = 5
-    instance._count_reset_energy_finished = 5
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
         const.CONF_MAX_SOLAR_POWER: 12_000,
@@ -143,20 +140,6 @@ def test_leaves_values_unchanged_when_a_reading_is_missing(
     assert result == current_data
 
 
-def test_accepts_daily_reset_during_midnight_window(
-    coordinator, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = datetime(2026, 8, 8, 0, 0, 30, tzinfo=timezone.utc)
-    coordinator._last_checked_time = now - timedelta(minutes=1)
-    coordinator._last_checked_data = {"grid_import_today": 10.0}
-
-    result = sanitize(coordinator, {"grid_import_today": 0.0}, now, monkeypatch)
-
-    assert result["grid_import_today"] == 0.0
-    assert coordinator._check_monotonic is False
-    assert coordinator._count_reset_energy_finished == 1
-
-
 @pytest.mark.parametrize(
     ("elapsed", "expected"),
     (
@@ -182,47 +165,32 @@ def test_handles_maximum_validation_window_boundary(
     assert result["grid_import_total"] == expected
 
 
-@pytest.mark.parametrize(
-    ("now", "sensor_key", "expected_reset"),
-    (
-        (datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc), "grid_import_today", True),
-        (
-            datetime(2026, 8, 8, 0, 0, 59, tzinfo=timezone.utc),
-            "grid_import_today",
-            True,
-        ),
-        (
-            datetime(2026, 8, 8, 0, 1, tzinfo=timezone.utc),
-            "grid_import_today",
-            False,
-        ),
-        (
-            datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc),
-            "grid_import_total",
-            False,
-        ),
-    ),
-    ids=(
-        "start-of-midnight-window",
-        "end-of-midnight-window",
-        "after-midnight-window",
-        "non-resetting-sensor",
-    ),
-)
-def test_daily_reset_window_boundaries(
+def test_accepts_daily_counter_reset_after_date_change(
     coordinator,
     monkeypatch: pytest.MonkeyPatch,
-    now: datetime,
-    sensor_key: str,
-    expected_reset: bool,
 ) -> None:
+    now = datetime(2026, 8, 8, 0, 0, 5, tzinfo=timezone.utc)
+    coordinator._last_checked_time = now - timedelta(seconds=10)
+    coordinator._last_checked_data = {
+        "grid_import_today": 10.0,
+        "previous_snapshot_marker": 1.0,
+    }
+
+    result = sanitize(coordinator, {"grid_import_today": 0.0}, now, monkeypatch)
+
+    assert result == {"grid_import_today": 0.0}
+
+
+def test_rejects_daily_counter_decrease_within_same_date(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
     coordinator._last_checked_time = now - timedelta(minutes=1)
-    coordinator._last_checked_data = {sensor_key: 10.0}
+    coordinator._last_checked_data = {"grid_import_today": 10.0}
 
-    result = sanitize(coordinator, {sensor_key: 0.0}, now, monkeypatch)
+    result = sanitize(coordinator, {"grid_import_today": 0.0}, now, monkeypatch)
 
-    assert result[sensor_key] == (0.0 if expected_reset else 10.0)
-    assert (coordinator._check_monotonic is False) is expected_reset
+    assert result == coordinator._last_checked_data
 
 
 def test_enforces_monotonic_energy_values(coordinator) -> None:
@@ -334,13 +302,36 @@ def test_raw_data_rejects_inconsistent_battery_count(
         asyncio.run(coordinator.async_get_raw_data())
 
 
-def test_update_propagates_connection_failure(coordinator) -> None:
+def test_raw_data_rejects_invalid_decoded_value(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = SimpleNamespace(
+        start_register=100,
+        num_read_regs=1,
+        content=(SimpleNamespace(key="battery_count", block_index=0, size=1),),
+    )
+    monkeypatch.setitem(coordinator_module.MOD_REGISTER_MAP, "blocks", (block,))
+    monkeypatch.setattr(coordinator_module, "decode_register", Mock(return_value=None))
+    coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_read_block = AsyncMock(return_value=[1])
+
+    with pytest.raises(coordinator_module.UpdateFailed, match="Invalid Modbus value"):
+        asyncio.run(coordinator.async_get_raw_data())
+
+
+def test_update_failure_preserves_last_accepted_snapshot(coordinator) -> None:
+    last_checked_time = datetime(2026, 8, 7, 23, 59, tzinfo=timezone.utc)
+    coordinator._last_checked_data = {"grid_import_today": 10.0}
+    coordinator._last_checked_time = last_checked_time
     coordinator.async_get_raw_data = AsyncMock(
         side_effect=coordinator_module.UpdateFailed("connection lost")
     )
 
     with pytest.raises(coordinator_module.UpdateFailed, match="connection lost"):
         asyncio.run(coordinator._async_update_data())
+
+    assert coordinator._last_checked_data == {"grid_import_today": 10.0}
+    assert coordinator._last_checked_time is last_checked_time
 
 
 def test_serial_number_failure_is_best_effort(coordinator) -> None:

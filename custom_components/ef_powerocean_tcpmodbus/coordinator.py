@@ -103,12 +103,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime = None
-        self._check_monotonic: bool = True
-        self._count_reset_energy_sensor: int = 0
-        for sensor in ENERGY_SENSOR_MAP:
-            if sensor.reset_at_midnight:
-                self._count_reset_energy_sensor += 1
-        self._count_reset_energy_finished: int = self._count_reset_energy_sensor
 
     @property
     def connected(self) -> bool:
@@ -195,7 +189,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
     def _sanitize_energy_values(self, data: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = dict(data)
-        self._check_monotonic = True
 
         now = dt.now()
         if self._last_checked_time is None or self._last_checked_data is None:
@@ -212,6 +205,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             return dict(self._last_checked_data)
 
         dt_hours = elapsed_seconds / 3600
+        date_changed = now.date() != self._last_checked_time.date()
         for energy_sensor in ENERGY_SENSOR_MAP:
             if energy_sensor.is_calculated:
                 continue
@@ -224,23 +218,16 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
                 continue
 
-            is_midnight_reset = (
+            if (
                 energy_sensor.reset_at_midnight
-                and current_energy == 0
-                and last_energy > 0
-                and now.hour == 0
-                and now.minute < 1
-            )
-            if is_midnight_reset:
-                # Reset nur zwischen 00:00 und 00:01 erlauben
-                _LOGGER.debug(f"Reset of entity {energy_sensor.key}")
-                if self._count_reset_energy_finished == self._count_reset_energy_sensor:
-                    # first counter reset after midnight
-                    self._count_reset_energy_finished = 0
-                result[energy_sensor.key] = 0
-                self._check_monotonic = False
-                self._count_reset_energy_finished += 1
-                continue
+                and current_energy < last_energy
+                and not date_changed
+            ):
+                _LOGGER.warning(
+                    "Skip entire data due to decreasing daily energy value %s",
+                    energy_sensor.key,
+                )
+                return dict(self._last_checked_data)
 
             energy_delta = current_energy - last_energy
             calculated_power = energy_delta / dt_hours
@@ -257,19 +244,25 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
                 return dict(self._last_checked_data)
 
-            if current_energy == 0 and last_energy > 0:
+            if (
+                not energy_sensor.reset_at_midnight
+                and current_energy == 0
+                and last_energy > 0
+            ):
                 _LOGGER.warning(
                     f"Skip entire data. Reason: 0 kWh of {energy_sensor.key}! (raw energy: {current_energy} last energy: {last_energy} delta energy: {round(energy_delta, 2)} dt: {dt_hours} power: {int(calculated_power)} limit: {limit} last check: {self._last_checked_time.time()})"
                 )
                 return dict(self._last_checked_data)
 
-            # Rückgabe des aktuellen Wertes nur wenn der neue Wert > letzter Wert ist
-            result[energy_sensor.key] = max(current_energy, last_energy)
+            if not energy_sensor.reset_at_midnight:
+                result[energy_sensor.key] = max(current_energy, last_energy)
 
         return result
 
     def _enforced_monotonic(self, data: dict[str, Any]) -> dict[str, Any]:
         for energy_senser in ENERGY_SENSOR_MAP:
+            if energy_senser.reset_at_midnight:
+                continue
             last = self._last_checked_data.get(energy_senser.key, None)
             current = data.get(energy_senser.key, None)
             if last is not None and current is not None and current < last:
@@ -284,17 +277,13 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         calculated_results = calculate_derived_values(
             TelemetryData.from_mapping(result),
             calculate_solar_power=self._ena_calc_solar_power,
-            daily_reset_complete=(
-                self._count_reset_energy_finished == self._count_reset_energy_sensor
-            ),
             startup_voltage=self.inverter_model.startup_voltage,
             max_battery_charge_power=MAX_BATTERY_CHARGED_POWER,
             max_battery_discharge_power=MAX_BATTERY_DISCHARGED_POWER,
         )
         result.update(calculated_results)
 
-        if self._check_monotonic:
-            result = self._enforced_monotonic(result)
+        result = self._enforced_monotonic(result)
 
         self._last_checked_data = dict(result)
         self._last_checked_time = dt.now()
