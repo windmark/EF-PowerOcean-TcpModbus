@@ -15,6 +15,7 @@ homeassistant = types.ModuleType("homeassistant")
 homeassistant_util = types.ModuleType("homeassistant.util")
 homeassistant_dt = types.ModuleType("homeassistant.util.dt")
 homeassistant_dt.now = datetime.now
+homeassistant_dt.parse_datetime = datetime.fromisoformat
 homeassistant_util.dt = homeassistant_dt
 
 homeassistant_const = types.ModuleType("homeassistant.const")
@@ -26,6 +27,8 @@ homeassistant_core.HomeAssistant = type("HomeAssistant", (), {})
 homeassistant_config_entries = types.ModuleType("homeassistant.config_entries")
 homeassistant_config_entries.ConfigEntry = type("ConfigEntry", (), {})
 homeassistant_helpers = types.ModuleType("homeassistant.helpers")
+homeassistant_storage = types.ModuleType("homeassistant.helpers.storage")
+homeassistant_storage.Store = type("Store", (), {})
 homeassistant_update_coordinator = types.ModuleType(
     "homeassistant.helpers.update_coordinator"
 )
@@ -60,6 +63,7 @@ DEPENDENCY_STUBS = {
     "homeassistant.core": homeassistant_core,
     "homeassistant.config_entries": homeassistant_config_entries,
     "homeassistant.helpers": homeassistant_helpers,
+    "homeassistant.helpers.storage": homeassistant_storage,
     "homeassistant.helpers.update_coordinator": homeassistant_update_coordinator,
     "pymodbus": pymodbus,
     "pymodbus.client": pymodbus_client,
