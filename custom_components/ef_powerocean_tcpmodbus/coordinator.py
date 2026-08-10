@@ -9,6 +9,7 @@ from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt
 from pymodbus import __version__ as pyModbusVersion
@@ -47,6 +48,7 @@ _LOGGER = logging.getLogger(__name__)
 
 MODBUS_TIMEOUT: Final = 20
 SLEEP_TIME_AFTER_RECONNECT: Final = 1
+RECONNECT_DELAYS: Final = (0, 5, 30, 120)
 MODBUS_EXCEPTION_NAMES: Final = {
     2: "IllegalAddress",
     4: "SlaveFailure",
@@ -109,6 +111,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
+        self._shutdown = False
 
     @property
     def connected(self) -> bool:
@@ -120,6 +123,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_client_shutdown(self) -> None:
         """Integration-Shutdown, closing connection"""
         _LOGGER.info("PowerOcean Shutdown. Closing Connection!")
+        self._shutdown = True
         self._client.close()
         await super().async_shutdown()
 
@@ -128,8 +132,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         await self._client.connect()
 
         if not self._client.connected:
-            _LOGGER.error("Modbus TCP not connected to %s:%s", self.host, self.port)
-            return
+            raise ConfigEntryNotReady(
+                f"Modbus TCP not connected to {self.host}:{self.port}"
+            )
 
         self.serial_number = await self.async_get_serial_number()
         _LOGGER.info(
@@ -151,29 +156,33 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         sn = "".join(chr((r >> 8) & 0xFF) + chr(r & 0xFF) for r in raw)
         return sn.strip().replace("\x00", "")
 
+    async def _try_connect(self) -> bool:
+        """Attempt a single connection, serialized against register reads."""
+        async with self._lock:
+            if await self._client.connect() and self._client.connected:
+                return True
+            self._client.close()
+            return False
+
     async def async_reconnect(self) -> bool:
-        """Client-Reconnect"""
-        delays = [0, 5, 30, 120]
+        """Reconnect with escalating backoff; returns True on success."""
         _LOGGER.debug(
             f"PowerOcean (SN: {self.serial_number}) is not connected. Start reconnect!"
         )
 
-        for i, delay in enumerate(delays):
-            async with self._lock:
-                if delay > 0:
-                    _LOGGER.debug(
-                        f"Reconnect failed! Wait {delay}s until next attempt."
-                    )
-                    await asyncio.sleep(delay)
+        for delay in RECONNECT_DELAYS:
+            if delay:
+                _LOGGER.debug(f"Reconnect failed! Wait {delay}s until next attempt.")
+                await asyncio.sleep(delay)
 
-                _LOGGER.debug(f"Modbus TCP reconnect (Attempt {i + 1}/4)...")
-                if await self._client.connect() and self._client.connected:
-                    _LOGGER.debug(
-                        f"Reconnect successful! (SN: {self.serial_number}) Atempts: {i + 1}/4"
-                    )
-                    await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT)
-                    return True
-                self._client.close()
+            if self._shutdown:
+                _LOGGER.debug("Reconnect aborted: integration is shutting down")
+                return False
+
+            if await self._try_connect():
+                _LOGGER.debug(f"Reconnect successful! (SN: {self.serial_number})")
+                await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT)
+                return True
 
         _LOGGER.error(
             "EF-Modbus-TCP: All reconnect attempts failed! \u2013 will retry next poll"
@@ -220,16 +229,23 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                         raw, register.block_index, register.size
                     )
                     if decode_value is None:
-                        raise UpdateFailed(
-                            f"Invalid Modbus value for {register.key} "
-                            f"in block 0x{register_block.start_register:04X}"
+                        # Skip a single bad register instead of dropping the whole poll.
+                        _LOGGER.warning(
+                            "Skipping invalid Modbus value for %s in block 0x%04X",
+                            register.key,
+                            register_block.start_register,
                         )
+                        continue
                     data[register.key] = decode_value
 
-            if data["battery_count"] != self.limits[CONF_BATTERY_COUNT]:
+            battery_count = data.get("battery_count")
+            if (
+                battery_count is not None
+                and battery_count != self.limits[CONF_BATTERY_COUNT]
+            ):
                 raise UpdateFailed(
                     "Received inconsistent battery count "
-                    f"{data['battery_count']} (expected "
+                    f"{battery_count} (expected "
                     f"{self.limits[CONF_BATTERY_COUNT]})"
                 )
 

@@ -23,6 +23,10 @@ homeassistant_const.Platform = type(
 )
 homeassistant_core = types.ModuleType("homeassistant.core")
 homeassistant_core.HomeAssistant = type("HomeAssistant", (), {})
+homeassistant_exceptions = types.ModuleType("homeassistant.exceptions")
+homeassistant_exceptions.ConfigEntryNotReady = type(
+    "ConfigEntryNotReady", (Exception,), {}
+)
 homeassistant_config_entries = types.ModuleType("homeassistant.config_entries")
 homeassistant_config_entries.ConfigEntry = type("ConfigEntry", (), {})
 homeassistant_helpers = types.ModuleType("homeassistant.helpers")
@@ -58,6 +62,7 @@ DEPENDENCY_STUBS = {
     "homeassistant.util.dt": homeassistant_dt,
     "homeassistant.const": homeassistant_const,
     "homeassistant.core": homeassistant_core,
+    "homeassistant.exceptions": homeassistant_exceptions,
     "homeassistant.config_entries": homeassistant_config_entries,
     "homeassistant.helpers": homeassistant_helpers,
     "homeassistant.helpers.update_coordinator": homeassistant_update_coordinator,

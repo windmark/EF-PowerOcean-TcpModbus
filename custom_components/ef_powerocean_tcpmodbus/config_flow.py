@@ -42,17 +42,15 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_validate_connection(host: str, port: int) -> bool:
     """Try to connect and read status register."""
+    client = AsyncModbusTcpClient(host, port=port, timeout=5)
     try:
-        client = AsyncModbusTcpClient(host, port=port, timeout=5)
         await client.connect()
-        if not client.connected:
-            return False
-        else:
-            client.close()
-            return True
+        return client.connected
     except Exception as e:
         _LOGGER.warning("EF-PowerOcean connection test failed: %s", e)
         return False
+    finally:
+        client.close()
 
 
 class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):

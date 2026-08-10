@@ -19,6 +19,7 @@ def coordinator():
     )
     instance._last_checked_data = {}
     instance._last_checked_time = None
+    instance._shutdown = False
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
         const.CONF_MAX_SOLAR_POWER: 12_000,
@@ -213,6 +214,31 @@ def test_enforces_monotonic_energy_values(coordinator) -> None:
     assert result["grid_import_today"] == 0.0
 
 
+def test_monotonic_allows_daily_house_energy_to_reset(coordinator) -> None:
+    coordinator._last_checked_data = {"house_energy_today": 20.0}
+    data = {"house_energy_today": 0.0}
+
+    result = coordinator._enforced_monotonic(data)
+
+    assert result["house_energy_today"] == 0.0
+
+
+def test_reconnect_aborts_on_shutdown(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.serial_number = "SN"
+    coordinator._shutdown = True
+    monkeypatch.setattr(coordinator_module.asyncio, "sleep", AsyncMock())
+    coordinator._client = SimpleNamespace(connect=AsyncMock(), close=Mock())
+
+    async def reconnect():
+        coordinator._lock = asyncio.Lock()
+        return await coordinator.async_reconnect()
+
+    assert asyncio.run(reconnect()) is False
+    coordinator._client.connect.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("is_error", "registers", "error_match"),
     (
@@ -345,21 +371,27 @@ def test_raw_data_rejects_inconsistent_battery_count(
         asyncio.run(coordinator.async_get_raw_data())
 
 
-def test_raw_data_rejects_invalid_decoded_value(
+def test_raw_data_skips_invalid_decoded_value(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     block = SimpleNamespace(
         start_register=100,
-        num_read_regs=1,
-        content=(SimpleNamespace(key="battery_count", block_index=0, size=1),),
+        num_read_regs=2,
+        content=(
+            SimpleNamespace(key="battery_count", block_index=0, size=1),
+            SimpleNamespace(key="grid_power", block_index=1, size=1),
+        ),
     )
     monkeypatch.setitem(coordinator_module.MOD_REGISTER_MAP, "blocks", (block,))
-    monkeypatch.setattr(coordinator_module, "decode_register", Mock(return_value=None))
+    monkeypatch.setattr(
+        coordinator_module, "decode_register", Mock(side_effect=(None, 42.0))
+    )
     coordinator._client = SimpleNamespace(connected=True)
-    coordinator.async_read_block = AsyncMock(return_value=[1])
+    coordinator.async_read_block = AsyncMock(return_value=[1, 42])
 
-    with pytest.raises(coordinator_module.UpdateFailed, match="Invalid Modbus value"):
-        asyncio.run(coordinator.async_get_raw_data())
+    result = asyncio.run(coordinator.async_get_raw_data())
+
+    assert result == {"grid_power": 42.0}
 
 
 def test_update_failure_preserves_last_accepted_snapshot(coordinator) -> None:

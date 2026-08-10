@@ -475,6 +475,7 @@ ENERGY_SENSOR_MAP: list[EnergySensorDef] = [
     ),
     EnergySensorDef(
         "house_energy_today",
+        reset_at_midnight=True,
         is_calculated=True,
         max_power=CONF_MAX_GRID_POWER,
     ),
