@@ -48,6 +48,9 @@ pymodbus_client = types.ModuleType("pymodbus.client")
 pymodbus_client.AsyncModbusTcpClient = type("AsyncModbusTcpClient", (), {})
 pymodbus_exceptions = types.ModuleType("pymodbus.exceptions")
 pymodbus_exceptions.ModbusException = type("ModbusException", (Exception,), {})
+pymodbus_exceptions.ModbusIOException = type(
+    "ModbusIOException", (pymodbus_exceptions.ModbusException,), {}
+)
 
 DEPENDENCY_STUBS = {
     "homeassistant": homeassistant,

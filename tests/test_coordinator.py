@@ -201,21 +201,34 @@ def test_enforces_monotonic_energy_values(coordinator) -> None:
     data = {
         "grid_import_total": 9.0,
         "grid_export_total": 6.0,
+        "grid_import_today": 0.0,
     }
+    coordinator._last_checked_data["grid_import_today"] = 2.0
 
     result = coordinator._enforced_monotonic(data)
 
     assert result is data
     assert result["grid_import_total"] == 10.0
     assert result["grid_export_total"] == 6.0
+    assert result["grid_import_today"] == 0.0
 
 
-@pytest.mark.parametrize("is_error", (False, True), ids=("success", "modbus-error"))
-def test_reads_register_block(coordinator, is_error: bool) -> None:
+@pytest.mark.parametrize(
+    ("is_error", "registers", "error_match"),
+    (
+        (False, [11, 22], None),
+        (True, [11, 22], "IllegalAddress.*code 2"),
+        (False, [11], "Incomplete Modbus response"),
+    ),
+    ids=("success", "modbus-error", "incomplete-response"),
+)
+def test_reads_complete_register_block(
+    coordinator, is_error: bool, registers: list[int], error_match: str | None
+) -> None:
     response = SimpleNamespace(
         isError=Mock(return_value=is_error),
         exception_code=2,
-        registers=[11, 22],
+        registers=registers,
     )
     coordinator._client = SimpleNamespace(
         read_holding_registers=AsyncMock(return_value=response)
@@ -226,8 +239,8 @@ def test_reads_register_block(coordinator, is_error: bool) -> None:
         coordinator._lock = asyncio.Lock()
         return await coordinator.async_read_block(100, 2)
 
-    if is_error:
-        with pytest.raises(coordinator_module.ModbusException):
+    if error_match:
+        with pytest.raises(coordinator_module.ModbusException, match=error_match):
             asyncio.run(read_block())
     else:
         assert asyncio.run(read_block()) == [11, 22]
@@ -266,11 +279,12 @@ def test_delegates_connection_and_decodes_raw_data(
 @pytest.mark.parametrize(
     ("error", "message"),
     (
+        (coordinator_module.ModbusIOException("timed out"), "I/O failed"),
         (coordinator_module.ModbusException("timed out"), "communication failed"),
         (OSError("network down"), "connection failed"),
         (asyncio.TimeoutError(), "connection failed"),
     ),
-    ids=("modbus", "network", "timeout"),
+    ids=("modbus-io", "modbus", "network", "timeout"),
 )
 def test_raw_data_closes_connection_and_raises_on_transport_failure(
     coordinator, error: Exception, message: str

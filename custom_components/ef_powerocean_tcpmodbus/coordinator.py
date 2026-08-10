@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt
 from pymodbus import __version__ as pyModbusVersion
 from pymodbus.client import AsyncModbusTcpClient
-from pymodbus.exceptions import ModbusException
+from pymodbus.exceptions import ModbusException, ModbusIOException
 
 from .const import (
     CONF_BATTERY_COUNT,
@@ -47,6 +47,11 @@ _LOGGER = logging.getLogger(__name__)
 
 MODBUS_TIMEOUT: Final = 20
 MODBUS_RETRIES: Final = 2
+MODBUS_EXCEPTION_NAMES: Final = {
+    2: "IllegalAddress",
+    4: "SlaveFailure",
+    11: "GatewayNoResponse",
+}
 
 
 class EcoflowCoordinator(DataUpdateCoordinator):
@@ -142,16 +147,25 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         sn = "".join(chr((r >> 8) & 0xFF) + chr(r & 0xFF) for r in raw)
         return sn.strip().replace("\x00", "")
 
-    async def async_read_block(self, addr: int, count: int) -> list[int] | None:
-        """Read *count* holding registers starting at *addr*.  Returns None on error."""
+    async def async_read_block(self, addr: int, count: int) -> list[int]:
+        """Read a complete block of holding registers."""
         async with self._lock:
             res = await self._client.read_holding_registers(
                 address=addr, count=count, device_id=self._client_slave_id
             )
             if res.isError():
-                # Modbus error response – connection may be stale
+                exception_code = res.exception_code
+                exception_name = MODBUS_EXCEPTION_NAMES.get(
+                    exception_code, "UnknownProtocolError"
+                )
                 raise ModbusException(
-                    f"Modbus error response at 0x{addr:04X} with Exception-Code {res.exception_code}"
+                    f"Modbus protocol error {exception_name} "
+                    f"(code {exception_code}) at 0x{addr:04X}"
+                )
+            if len(res.registers) != count:
+                raise ModbusException(
+                    f"Incomplete Modbus response at 0x{addr:04X}: "
+                    f"received {len(res.registers)} of {count} registers"
                 )
             return res.registers
 
@@ -168,6 +182,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                     decode_value = decode_register(
                         raw, register.block_index, register.size
                     )
+                    if decode_value is None:
+                        raise UpdateFailed(
+                            f"Invalid Modbus value for {register.key} "
+                            f"in block 0x{register_block.start_register:04X}"
+                        )
                     data[register.key] = decode_value
 
             if data["battery_count"] != self.limits[CONF_BATTERY_COUNT]:
@@ -178,6 +197,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
 
             return data
+        except ModbusIOException as err:
+            self._client.close()
+            raise UpdateFailed(f"Modbus I/O failed: {err}") from err
         except ModbusException as err:
             self._client.close()
             raise UpdateFailed(f"Modbus communication failed: {err}") from err
