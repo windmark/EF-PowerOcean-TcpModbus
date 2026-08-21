@@ -345,6 +345,41 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         return result
 
+    def _has_accepted_daily_reset(self, data: dict[str, Any]) -> bool:
+        return any(
+            energy_sensor.resets_daily
+            and not energy_sensor.is_calculated
+            and data.get(energy_sensor.key) is not None
+            and self._last_checked_data.get(energy_sensor.key) is not None
+            and data[energy_sensor.key] < self._last_checked_data[energy_sensor.key]
+            for energy_sensor in ENERGY_SENSOR_MAP
+        )
+
+    def _clamp_calculated_energy_values(
+        self, data: dict[str, Any], *, accepted_daily_reset: bool
+    ) -> dict[str, Any]:
+        """Keep calculated total-increasing sensors monotonic between resets.
+
+        Derived values sum independently rounded counters, so they can dip by a
+        small kWh without a real decrease. Hold the last value to prevent this.
+        """
+        result = dict(data)
+
+        for energy_sensor in ENERGY_SENSOR_MAP:
+            if not energy_sensor.is_calculated:
+                continue
+
+            current_energy = result.get(energy_sensor.key)
+            last_energy = self._last_checked_data.get(energy_sensor.key)
+            if current_energy is None or last_energy is None:
+                continue
+
+            is_daily_reset = energy_sensor.resets_daily and accepted_daily_reset
+            if current_energy < last_energy and not is_daily_reset:
+                result[energy_sensor.key] = last_energy
+
+        return result
+
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             if (raw_data := await self.async_get_raw_data()) is None:
@@ -359,6 +394,10 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 max_battery_discharge_power=MAX_BATTERY_DISCHARGED_POWER,
             )
             result.update(calculated_results)
+            result = self._clamp_calculated_energy_values(
+                result,
+                accepted_daily_reset=self._has_accepted_daily_reset(result),
+            )
 
             self._last_checked_data = dict(result)
             self._last_checked_time = dt.now()
