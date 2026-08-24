@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import struct
 import sys
 import time
@@ -192,6 +193,91 @@ def format_decoded_value(value: int | float) -> str:
     return f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
+def signed_int16(value: int) -> int:
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def byte_swap16(value: int) -> int:
+    return ((value & 0xFF) << 8) | (value >> 8)
+
+
+def decode_float32_candidates(first_word: int, second_word: int) -> dict[str, float]:
+    """Decode two raw words using the four common byte/word orders."""
+    raw = struct.pack(">HH", first_word, second_word)
+    byte_orders = {
+        "ABCD": raw,
+        "BADC": raw[1::-1] + raw[3:1:-1],
+        "CDAB": raw[2:] + raw[:2],
+        "DCBA": raw[::-1],
+    }
+    return {
+        order: value
+        for order, candidate in byte_orders.items()
+        if math.isfinite(value := struct.unpack(">f", candidate)[0])
+    }
+
+
+def print_unknown_candidates(
+    before: dict[int, int],
+    after: dict[int, int],
+    unknown_changes: list[int],
+    mapped_addresses: set[int],
+) -> None:
+    print("Unknown 16-bit candidates")
+    print("Register  Encoding          Before          After           Delta")
+    print("-" * 73)
+    for address in unknown_changes:
+        old_value = before[address]
+        new_value = after[address]
+        interpretations = (
+            ("UINT16", old_value, new_value),
+            ("INT16", signed_int16(old_value), signed_int16(new_value)),
+            ("UINT16 byte-swap", byte_swap16(old_value), byte_swap16(new_value)),
+            (
+                "INT16 byte-swap",
+                signed_int16(byte_swap16(old_value)),
+                signed_int16(byte_swap16(new_value)),
+            ),
+        )
+        for index, (encoding, old_decoded, new_decoded) in enumerate(interpretations):
+            address_text = str(address) if index == 0 else ""
+            raw_hex = f" (0x{old_value:04X})" if index == 0 else ""
+            print(
+                f"{address_text:<9} {encoding:<17} {old_decoded:>7}{raw_hex:<9} "
+                f"{new_decoded:>7}          {new_decoded - old_decoded:+d}"
+            )
+
+    available_unknowns = (before.keys() & after.keys()) - mapped_addresses
+    pair_starts = sorted(
+        {
+            start
+            for address in unknown_changes
+            for start in (address - 1, address)
+            if {start, start + 1} <= available_unknowns
+        }
+    )
+    if not pair_starts:
+        return
+
+    print()
+    print("Adjacent unknown 32-bit float candidates")
+    print("Registers    Order  Before          After           Delta")
+    print("-" * 67)
+    for start in pair_starts:
+        old_candidates = decode_float32_candidates(before[start], before[start + 1])
+        new_candidates = decode_float32_candidates(after[start], after[start + 1])
+        for index, order in enumerate(("ABCD", "BADC", "CDAB", "DCBA")):
+            if order not in old_candidates or order not in new_candidates:
+                continue
+            old_value = old_candidates[order]
+            new_value = new_candidates[order]
+            registers = f"{start}-{start + 1}" if index == 0 else ""
+            print(
+                f"{registers:<12} {order:<6} {old_value:>14.7g}  "
+                f"{new_value:>14.7g}  {new_value - old_value:+.7g}"
+            )
+
+
 def print_changes(
     before: dict[int, int],
     after: dict[int, int],
@@ -246,16 +332,7 @@ def print_changes(
 
     if mapped_changes:
         print()
-    print("Unknown raw register changes")
-    print("Register  Before          After           Delta")
-    print("-" * 57)
-    for address in unknown_changes:
-        old_value = before[address]
-        new_value = after[address]
-        print(
-            f"{address:<9} {old_value:>5} (0x{old_value:04X})  "
-            f"{new_value:>5} (0x{new_value:04X})  {new_value - old_value:+d}"
-        )
+    print_unknown_candidates(before, after, unknown_changes, mapped_addresses)
 
 
 def monitor(client: ModbusTcpClient, args: argparse.Namespace) -> None:

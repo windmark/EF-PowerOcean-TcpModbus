@@ -28,7 +28,7 @@
 
 ## Overview
 
-EcoFlow does **not publish an official Modbus register map** for the PowerOcean Plus.  
+EcoFlow does **not publish an official Modbus register map** for the PowerOcean Plus.
 This documentation was created by scanning the device and cross-referencing values with the official EcoFlow Home Assistant integration (Cloud API).
 
 All registers were discovered empirically on firmware version unknown, hardware serial `R371ZDH4ZGAW0028`.
@@ -195,7 +195,7 @@ Values reset at midnight.
 
 ### Configuration Registers
 
-These registers appear to hold device configuration. Their exact meaning is not fully confirmed.  
+These registers appear to hold device configuration. Their exact meaning is not fully confirmed.
 **Do not write to these registers unless you know what you are doing.**
 
 | Register | Value (observed) | Notes                                           |
@@ -283,8 +283,11 @@ interval.
 
 ### Discovering Unknown Registers
 
-The `discover` command compares raw UINT16 snapshots and reports every changed
-register in decimal and hexadecimal. It reads registers `40519–40628` by default
+The `discover` command compares snapshots and reports every changed value.
+Mapped registers use their definition from `const.py`. Changed unknown words are
+shown as unsigned, signed, and byte-swapped 16-bit candidates. Adjacent unknown
+pairs are also decoded as IEEE 754 floats using the common `ABCD`, `BADC`,
+`CDAB`, and `DCBA` byte/word orders. It reads registers `40519–40628` by default
 and never writes to the device.
 
 ```bash
@@ -300,7 +303,9 @@ To investigate the minimum SOC register:
 4. Repeat with a different minimum SOC value.
 
 The baseline is updated after each comparison, which helps distinguish the
-setting from changing telemetry.
+setting from changing telemetry. Candidate decoding is not proof by itself: the
+same address, encoding, and two-register boundary should reproduce several app
+values and deltas before updating the integration's register map.
 
 Use `--start` and `--end` after `discover` to scan a different inclusive holding
 register range. Use `--port` or `--device-id` before the command when the device
@@ -355,7 +360,7 @@ Please open an issue before submitting large PRs.
 
 ## Disclaimer
 
-This register map was discovered through community reverse engineering.  
+This register map was discovered through community reverse engineering.
 **EcoFlow does not officially support or document this Modbus interface.**
 
 - Use at your own risk
