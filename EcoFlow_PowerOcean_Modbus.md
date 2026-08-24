@@ -312,6 +312,26 @@ Use `--start` and `--end` after `discover` to scan a different inclusive holding
 register range. Use `--port` or `--device-id` before the command when the device
 does not use the defaults.
 
+### Discovering On/Off Settings
+
+For battery preheating and other binary app options, use the guided toggle scan:
+
+```bash
+uv run --with 'pymodbus>=3.6,<4' python scripts/powerocean_modbus.py \
+    192.168.x.x discover-toggle --setting "battery preheating"
+```
+
+The script prompts for `OFF → ON → OFF → ON` and reports only registers that
+repeat both raw values exactly. It also shows the XOR mask, changed bit numbers,
+and whether a single changed bit is active-high or active-low. This removes most
+changing telemetry from the result.
+
+No result means the option did not repeat in holding registers `40519–40628`.
+Retry after allowing more time for each app change, then widen the range with
+`--start` and `--end`. The setting may also be cloud-only, use another Modbus
+data area, or represent runtime heater activity rather than the configured app
+option.
+
 ---
 
 ## Known Limitations

@@ -378,6 +378,88 @@ def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
         comparison_number += 1
 
 
+def capture_toggle_state(
+    client: ModbusTcpClient,
+    args: argparse.Namespace,
+    state: str,
+    step: int,
+) -> dict[int, int]:
+    input(f"\nSet {args.setting} {state} in the EcoFlow app, then press Enter...")
+    snapshot = read_range(client, args.start, args.end, args.device_id)
+    captured_at = datetime.now().astimezone().strftime("%H:%M:%S %Z")
+    print(f"Captured step {step}/4: {state} at {captured_at}")
+    return snapshot
+
+
+def print_toggle_candidates(
+    off_first: dict[int, int],
+    on_first: dict[int, int],
+    off_second: dict[int, int],
+    on_second: dict[int, int],
+    registers: tuple[Register, ...],
+) -> None:
+    labels = {
+        register.address: register.label for register in registers if register.size == 1
+    }
+    common_addresses = (
+        off_first.keys() & on_first.keys() & off_second.keys() & on_second.keys()
+    )
+    candidates = [
+        address
+        for address in sorted(common_addresses)
+        if off_first[address] == off_second[address]
+        and on_first[address] == on_second[address]
+        and off_first[address] != on_first[address]
+    ]
+
+    print()
+    print("=" * 103)
+    print("REPEATED OFF -> ON -> OFF -> ON CANDIDATES")
+    print("=" * 103)
+    if not candidates:
+        print("No register followed the repeated toggle pattern.")
+        print("Try a wider --start/--end range or wait for the app change to apply.")
+        return
+
+    print(
+        "Register  OFF             ON              XOR mask  Bits       Meaning       Description"
+    )
+    print("-" * 103)
+    for address in candidates:
+        off_value = off_first[address]
+        on_value = on_first[address]
+        xor_mask = off_value ^ on_value
+        bits = [bit for bit in range(16) if xor_mask & (1 << bit)]
+        bit_text = ",".join(str(bit) for bit in bits)
+        if len(bits) == 1:
+            bit_mask = 1 << bits[0]
+            meaning = "active-high" if on_value & bit_mask else "active-low"
+        else:
+            meaning = "multi-bit"
+        print(
+            f"{address:<9} {off_value:>5} (0x{off_value:04X})  "
+            f"{on_value:>5} (0x{on_value:04X})  0x{xor_mask:04X}    "
+            f"{bit_text:<10} {meaning:<13} {labels.get(address, 'Unknown')}"
+        )
+
+    print()
+    print(
+        "Strongest candidates change exactly one bit and repeat the same raw OFF "
+        "and ON values in both cycles."
+    )
+
+
+def discover_toggle(client: ModbusTcpClient, args: argparse.Namespace) -> None:
+    registers = build_registers(args.inverter_model)
+    print(f"Scanning holding registers {args.start}-{args.end} for {args.setting}.")
+    print("This guided mode is read-only and requires two complete toggle cycles.")
+    off_first = capture_toggle_state(client, args, "OFF", 1)
+    on_first = capture_toggle_state(client, args, "ON", 2)
+    off_second = capture_toggle_state(client, args, "OFF", 3)
+    on_second = capture_toggle_state(client, args, "ON", 4)
+    print_toggle_candidates(off_first, on_first, off_second, on_second, registers)
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read-only EcoFlow PowerOcean Modbus monitor and discovery tool."
@@ -405,12 +487,21 @@ def create_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--start", type=int, default=DEFAULT_DISCOVERY_START)
     discover_parser.add_argument("--end", type=int, default=DEFAULT_DISCOVERY_END)
     discover_parser.set_defaults(handler=discover)
+
+    toggle_parser = subparsers.add_parser(
+        "discover-toggle",
+        help="Find a binary register or bit using repeated OFF/ON captures",
+    )
+    toggle_parser.add_argument("--start", type=int, default=DEFAULT_DISCOVERY_START)
+    toggle_parser.add_argument("--end", type=int, default=DEFAULT_DISCOVERY_END)
+    toggle_parser.add_argument("--setting", default="battery preheating")
+    toggle_parser.set_defaults(handler=discover_toggle)
     return parser
 
 
 def main() -> int:
     args = create_parser().parse_args()
-    if args.command == "discover" and args.start > args.end:
+    if args.command in {"discover", "discover-toggle"} and args.start > args.end:
         raise SystemExit("--start must be less than or equal to --end")
 
     client: Any = ModbusTcpClient(args.host, port=args.port, timeout=3)
