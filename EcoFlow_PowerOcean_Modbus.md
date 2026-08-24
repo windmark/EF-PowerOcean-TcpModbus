@@ -288,7 +288,8 @@ Mapped registers use their definition from `const.py`. Changed unknown words are
 shown as unsigned, signed, and byte-swapped 16-bit candidates. Adjacent unknown
 pairs are also decoded as IEEE 754 floats using the common `ABCD`, `BADC`,
 `CDAB`, and `DCBA` byte/word orders. It reads registers `40519–40628` by default
-and never writes to the device.
+and never writes to the device. Each capture has a numbered, timestamped heading;
+two-register values are displayed explicitly, for example `40549 + 40550`.
 
 ```bash
 uv run --with 'pymodbus>=3.6,<4' python scripts/powerocean_modbus.py \

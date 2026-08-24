@@ -10,6 +10,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -193,6 +194,10 @@ def format_decoded_value(value: int | float) -> str:
     return f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
+def format_registers(start: int, size: int) -> str:
+    return " + ".join(str(address) for address in range(start, start + size))
+
+
 def signed_int16(value: int) -> int:
     return value - 0x10000 if value & 0x8000 else value
 
@@ -261,8 +266,8 @@ def print_unknown_candidates(
 
     print()
     print("Adjacent unknown 32-bit float candidates")
-    print("Registers    Order  Before          After           Delta")
-    print("-" * 67)
+    print("Registers        Order  Before          After           Delta")
+    print("-" * 71)
     for start in pair_starts:
         old_candidates = decode_float32_candidates(before[start], before[start + 1])
         new_candidates = decode_float32_candidates(after[start], after[start + 1])
@@ -271,9 +276,9 @@ def print_unknown_candidates(
                 continue
             old_value = old_candidates[order]
             new_value = new_candidates[order]
-            registers = f"{start}-{start + 1}" if index == 0 else ""
+            registers = format_registers(start, 2) if index == 0 else ""
             print(
-                f"{registers:<12} {order:<6} {old_value:>14.7g}  "
+                f"{registers:<16} {order:<6} {old_value:>14.7g}  "
                 f"{new_value:>14.7g}  {new_value - old_value:+.7g}"
             )
 
@@ -314,11 +319,7 @@ def print_changes(
         )
         print("-" * 91)
         for register, old_value, new_value in mapped_changes:
-            address = (
-                str(register.address)
-                if register.size == 1
-                else f"{register.address}-{register.address + register.size - 1}"
-            )
+            address = format_registers(register.address, register.size)
             delta = new_value - old_value
             print(
                 f"{address:<16} {format_decoded_value(old_value):<15} "
@@ -358,12 +359,23 @@ def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
         "then press Enter. Press Ctrl+C to stop."
     )
 
+    comparison_number = 1
     while True:
-        input()
+        input(
+            f"\nChange the setting, then press Enter to capture comparison "
+            f"#{comparison_number}..."
+        )
         current = read_range(client, args.start, args.end, args.device_id)
+        captured_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        print()
+        print("=" * 91)
+        print(f"COMPARISON #{comparison_number}  |  {captured_at}")
+        print("=" * 91)
         print_changes(baseline, current, registers)
         baseline = current
-        print("Baseline updated. Make another app change, then press Enter.")
+        print("-" * 91)
+        print(f"Comparison #{comparison_number} complete; this is the new baseline.")
+        comparison_number += 1
 
 
 def create_parser() -> argparse.ArgumentParser:
