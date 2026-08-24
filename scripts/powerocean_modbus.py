@@ -494,7 +494,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     toggle_parser.add_argument("--start", type=int, default=DEFAULT_DISCOVERY_START)
     toggle_parser.add_argument("--end", type=int, default=DEFAULT_DISCOVERY_END)
-    toggle_parser.add_argument("--setting", default="battery preheating")
+    toggle_parser.add_argument("--setting", default="setting to")
     toggle_parser.set_defaults(handler=discover_toggle)
     return parser
 
