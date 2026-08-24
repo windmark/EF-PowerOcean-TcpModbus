@@ -181,31 +181,80 @@ def render_monitor(snapshot: dict[int, int], registers: tuple[Register, ...]) ->
     return "\n".join(lines)
 
 
-def changed_registers(
-    before: dict[int, int], after: dict[int, int]
-) -> list[tuple[int, int, int]]:
-    """Return address, old value, and new value for changed registers."""
-    return [
-        (address, before[address], after[address])
-        for address in sorted(before.keys() & after.keys())
-        if before[address] != after[address]
-    ]
+def decode_register(snapshot: dict[int, int], register: Register) -> int | float:
+    """Decode one mapped value from a raw snapshot."""
+    if register.size == 1:
+        return snapshot[register.address]
+    return decode_float32(snapshot[register.address], snapshot[register.address + 1])
+
+
+def format_decoded_value(value: int | float) -> str:
+    return f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
 def print_changes(
-    changes: list[tuple[int, int, int]], register_labels: dict[int, str]
+    before: dict[int, int],
+    after: dict[int, int],
+    registers: tuple[Register, ...],
 ) -> None:
-    if not changes:
+    changed_addresses = {
+        address
+        for address in before.keys() & after.keys()
+        if before[address] != after[address]
+    }
+    if not changed_addresses:
         print("No register changes detected.")
         return
 
-    print("Register  Before          After           Delta   Description")
-    print("-" * 84)
-    for address, before, after in changes:
+    mapped_changes = []
+    mapped_addresses = set()
+    for register in registers:
+        addresses = set(range(register.address, register.address + register.size))
+        if not addresses <= before.keys() or not addresses <= after.keys():
+            continue
+        mapped_addresses.update(addresses)
+        if addresses & changed_addresses:
+            mapped_changes.append(
+                (
+                    register,
+                    decode_register(before, register),
+                    decode_register(after, register),
+                )
+            )
+
+    if mapped_changes:
         print(
-            f"{address:<9} {before:>5} (0x{before:04X})  "
-            f"{after:>5} (0x{after:04X})  {after - before:+6d}  "
-            f"{register_labels.get(address, 'Unknown')}"
+            "Mapped value     Before          After           Delta       Description"
+        )
+        print("-" * 91)
+        for register, old_value, new_value in mapped_changes:
+            address = (
+                str(register.address)
+                if register.size == 1
+                else f"{register.address}-{register.address + register.size - 1}"
+            )
+            delta = new_value - old_value
+            print(
+                f"{address:<16} {format_decoded_value(old_value):<15} "
+                f"{format_decoded_value(new_value):<15} {delta:+11.3f}  "
+                f"{register.unit:<5} {register.label}"
+            )
+
+    unknown_changes = sorted(changed_addresses - mapped_addresses)
+    if not unknown_changes:
+        return
+
+    if mapped_changes:
+        print()
+    print("Unknown raw register changes")
+    print("Register  Before          After           Delta")
+    print("-" * 57)
+    for address in unknown_changes:
+        old_value = before[address]
+        new_value = after[address]
+        print(
+            f"{address:<9} {old_value:>5} (0x{old_value:04X})  "
+            f"{new_value:>5} (0x{new_value:04X})  {new_value - old_value:+d}"
         )
 
 
@@ -221,10 +270,7 @@ def monitor(client: ModbusTcpClient, args: argparse.Namespace) -> None:
 
 
 def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
-    register_labels = {
-        register.address: register.label
-        for register in build_registers(args.inverter_model)
-    }
+    registers = build_registers(args.inverter_model)
     print(
         f"Reading holding registers {args.start}-{args.end}. "
         "This mode never writes to the device."
@@ -238,7 +284,7 @@ def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
     while True:
         input()
         current = read_range(client, args.start, args.end, args.device_id)
-        print_changes(changed_registers(baseline, current), register_labels)
+        print_changes(baseline, current, registers)
         baseline = current
         print("Baseline updated. Make another app change, then press Enter.")
 
