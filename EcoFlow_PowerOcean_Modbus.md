@@ -270,127 +270,41 @@ def read_ascii(client, addr, count):
 
 ## Python Monitor Script
 
-Full live monitor with 1-second refresh:
+The read-only [`scripts/powerocean_modbus.py`](scripts/powerocean_modbus.py)
+utility provides a live monitor based on the integration's current register map:
 
-```python
-from pymodbus.client import ModbusTcpClient
-import struct, time, os
-
-TARGET_IP = "192.168.x.x"  # <-- set your device IP here
-
-client = ModbusTcpClient(TARGET_IP, port=502, timeout=3)
-client.connect()
-
-def reg(addr):
-    r = client.read_holding_registers(addr, count=1, slave=1)
-    return r.registers[0] if not r.isError() else None
-
-def fl(addr, scale=1):
-    r = client.read_holding_registers(addr, count=2, slave=1)
-    if r.isError():
-        return None
-    raw = struct.pack('>HH', r.registers[1], r.registers[0])
-    return round(struct.unpack('>f', raw)[0] * scale, 2)
-
-while True:
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-    status     = reg(42081)
-    soc        = reg(42082)
-
-    u_l1       = fl(40580)
-    u_l2       = fl(40582)
-    u_l3       = fl(40584)
-    i_l1       = fl(40586)
-    i_l2       = fl(40588)
-    i_l3       = fl(40590)
-    freq       = fl(40592)
-    p_watt     = fl(40596, scale=10)
-    s_va       = fl(40598, scale=10)
-
-    pv_pwr     = fl(40574, scale=100)
-    pv1_amp    = fl(40602)
-    pv2_amp    = fl(40604)
-    pv3_amp    = fl(40606)
-
-    bat_pwr    = fl(40576, scale=1000)
-    bat_temp   = fl(40578)
-    bat_remain = fl(42227)
-    inv_temp   = fl(40600)
-
-    e_pv1_h    = fl(42195)
-    e_pv2_h    = fl(42211)
-    e_export_h = fl(42179)
-    e_import_h = fl(42163)
-    e_bat_ch_h = fl(42243)
-    e_bat_ds_h = fl(42145)
-
-    e_pv1_ges  = fl(42193)
-    e_pv2_ges  = fl(42209)
-    e_bat_ch_g = fl(42225)
-    e_bat_ds_g = fl(42241)
-    e_bat_net  = fl(42113)
-    e_total    = fl(42257)
-
-    netz_pfeil = "-> Feed-in" if p_watt and p_watt > 0 else "<- Consumption"
-    bat_pfeil  = "Charging" if bat_pwr and bat_pwr > 50 else (
-                 "Discharging" if bat_pwr and bat_pwr < -50 else "Standby")
-    soc_bar    = ('|' * (soc // 10)).ljust(10)
-    pv_total_h = round((e_pv1_h or 0) + (e_pv2_h or 0), 2)
-
-    print("=" * 50)
-    print("  EcoFlow PowerOcean Plus – Live Monitor")
-    print("=" * 50)
-    print(f"  Status:    {'Online' if status == 1 else 'Offline'}")
-    print(f"  Battery:   [{soc_bar}] {soc}% SOC")
-    print(f"  Remaining: {bat_remain} kWh")
-    print("-" * 50)
-    print("  SOLAR")
-    print(f"    PV Total:    {pv_pwr:>8.0f} W")
-    print(f"    String 1:    {pv1_amp:>8.3f} A")
-    print(f"    String 2:    {pv2_amp:>8.3f} A")
-    print(f"    String 3:    {pv3_amp:>8.3f} A")
-    print("-" * 50)
-    print("  BATTERY")
-    print(f"    Power:       {bat_pwr:>8.0f} W  ({bat_pfeil})")
-    print(f"    Temperature: {bat_temp:>7.1f} C")
-    print("-" * 50)
-    print("  GRID            VOLTAGE     CURRENT")
-    print(f"    L1:           {u_l1:>7.2f} V   {i_l1:>6.3f} A")
-    print(f"    L2:           {u_l2:>7.2f} V   {i_l2:>6.3f} A")
-    print(f"    L3:           {u_l3:>7.2f} V   {i_l3:>6.3f} A")
-    print(f"    Frequency:    {freq:>7.3f} Hz")
-    print("-" * 50)
-    print("  POWER")
-    print(f"    Active:      {p_watt:>8.0f} W  ({netz_pfeil})")
-    print(f"    Apparent:    {s_va:>8.0f} VA")
-    print("-" * 50)
-    print("  TEMPERATURE")
-    print(f"    Battery:     {bat_temp:>7.1f} C")
-    print(f"    Inverter:    {inv_temp:>7.1f} C")
-    print("-" * 50)
-    print("  ENERGY TODAY")
-    print(f"    PV Total:    {pv_total_h:>7.3f} kWh")
-    print(f"    PV String 1: {e_pv1_h:>7.3f} kWh")
-    print(f"    PV String 2: {e_pv2_h:>7.3f} kWh")
-    print(f"    Grid Export: {e_export_h:>7.3f} kWh")
-    print(f"    Grid Import: {e_import_h:>7.3f} kWh")
-    print(f"    Bat. Charge: {e_bat_ch_h:>7.3f} kWh")
-    print(f"    Bat. Disch.: {e_bat_ds_h:>7.3f} kWh")
-    print("-" * 50)
-    print("  ENERGY LIFETIME")
-    print(f"    PV String 1: {e_pv1_ges:>9.2f} kWh")
-    print(f"    PV String 2: {e_pv2_ges:>9.2f} kWh")
-    print(f"    Bat. Charged:{e_bat_ch_g:>9.2f} kWh")
-    print(f"    Bat. Disch.: {e_bat_ds_g:>9.2f} kWh")
-    print(f"    Bat. Net:    {e_bat_net:>9.2f} kWh")
-    print(f"    Total:       {e_total:>9.2f} kWh")
-    print("=" * 50)
-    print("  Press CTRL+C to quit   Refresh: 1s")
-    print("=" * 50)
-
-    time.sleep(1)
+```bash
+uv run --with 'pymodbus>=3.6,<4' python scripts/powerocean_modbus.py \
+    192.168.x.x monitor
 ```
+
+Use `--once` for a single sample or `--interval SECONDS` to change the refresh
+interval.
+
+### Discovering Unknown Registers
+
+The `discover` command compares raw UINT16 snapshots and reports every changed
+register in decimal and hexadecimal. It reads registers `40519–40628` by default
+and never writes to the device.
+
+```bash
+uv run --with 'pymodbus>=3.6,<4' python scripts/powerocean_modbus.py \
+    192.168.x.x discover
+```
+
+To investigate the minimum SOC register:
+
+1. Start `discover` and wait for the baseline confirmation.
+2. Change only the minimum SOC setting in the EcoFlow app.
+3. Press Enter and note registers whose delta matches the setting change.
+4. Repeat with a different minimum SOC value.
+
+The baseline is updated after each comparison, which helps distinguish the
+setting from changing telemetry.
+
+Use `--start` and `--end` after `discover` to scan a different inclusive holding
+register range. Use `--port` or `--device-id` before the command when the device
+does not use the defaults.
 
 ---
 
