@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import struct
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from pymodbus.client import ModbusTcpClient
@@ -17,49 +21,65 @@ DEFAULT_DEVICE_ID = 1
 DEFAULT_DISCOVERY_START = 40519
 DEFAULT_DISCOVERY_END = 40628
 MAX_READ_REGISTERS = 125
+CONST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "custom_components"
+    / "ef_powerocean_tcpmodbus"
+    / "const.py"
+)
+
+
+def load_const_module() -> ModuleType:
+    """Load const.py without importing the Home Assistant integration package."""
+    module_name = "_ef_powerocean_tcpmodbus_const"
+    spec = importlib.util.spec_from_file_location(module_name, CONST_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load integration constants from {CONST_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+const = load_const_module()
 
 
 @dataclass(frozen=True)
 class Register:
+    key: str
     address: int
     label: str
-    data_type: str = "float32"
+    size: int
     unit: str = ""
 
 
-MONITOR_REGISTERS = (
-    Register(40519, "House power", unit="W"),
-    Register(40521, "Grid power", unit="W"),
-    Register(40523, "Solar power", unit="W"),
-    Register(40525, "Battery power", unit="W"),
-    Register(40527, "Battery SOC", "uint16", "%"),
-    Register(40528, "Inverter rated power", "uint16", "W"),
-    Register(40530, "System modes", "uint16"),
-    Register(40536, "Minimum SOC limit (candidate)", "uint16", "%"),
-    Register(40540, "Battery temperature warning", "uint16", "C"),
-    Register(40541, "Device LED brightness", "uint16", "%"),
-    Register(40546, "Inverter power limit", "uint16", "W"),
-    Register(40548, "Maximum inverter power", "uint16", "W"),
-    Register(40552, "Battery capacity", "uint16", "Wh"),
-    Register(40556, "Battery charge power limit", "uint16", "W"),
-    Register(40574, "Battery voltage", unit="V"),
-    Register(40576, "Battery current", unit="A"),
-    Register(40578, "Battery temperature", unit="C"),
-    Register(40580, "Voltage L1", unit="V"),
-    Register(40582, "Voltage L2", unit="V"),
-    Register(40584, "Voltage L3", unit="V"),
-    Register(40586, "Current L1", unit="A"),
-    Register(40588, "Current L2", unit="A"),
-    Register(40590, "Current L3", unit="A"),
-    Register(40592, "Frequency", unit="Hz"),
-    Register(40596, "PV1 voltage", unit="V"),
-    Register(40598, "PV2 voltage", unit="V"),
-    Register(40600, "PV3 voltage", unit="V"),
-    Register(40602, "PV1 current", unit="A"),
-    Register(40604, "PV2 current", unit="A"),
-    Register(40606, "PV3 current", unit="A"),
-)
-REGISTER_LABELS = {register.address: register.label for register in MONITOR_REGISTERS}
+def build_registers(inverter_model: Any) -> tuple[Register, ...]:
+    """Build register metadata from the integration's canonical map."""
+    sensor_definitions = {
+        definition.key: definition
+        for definition in (*const.SENSOR_MAP, *const.ENERGY_SENSOR_MAP)
+    }
+    registers = []
+    for block in const.MOD_REGISTER_MAP["blocks"]:
+        for definition in block.content:
+            sensor = sensor_definitions.get(definition.key)
+            label = (
+                sensor.name
+                if sensor is not None and sensor.name
+                else definition.key.replace("_", " ").title()
+            )
+            unit = sensor.unit if sensor is not None and sensor.unit else ""
+            registers.append(
+                Register(
+                    key=definition.key,
+                    address=block.start_register
+                    + definition.block_index_for(inverter_model),
+                    label=label,
+                    size=definition.size,
+                    unit=unit,
+                )
+            )
+    return tuple(sorted(registers, key=lambda register: register.address))
 
 
 def read_holding_registers(
@@ -117,17 +137,38 @@ def read_range(
     return values
 
 
+def read_mapped_registers(
+    client: ModbusTcpClient,
+    registers: tuple[Register, ...],
+    device_id: int,
+) -> dict[int, int]:
+    """Read mapped registers without spanning large gaps between blocks."""
+    snapshot: dict[int, int] = {}
+    group_start = registers[0].address
+    group_end = group_start + registers[0].size - 1
+
+    for register in registers[1:]:
+        register_end = register.address + register.size - 1
+        if register_end - group_start + 1 > MAX_READ_REGISTERS:
+            snapshot.update(read_range(client, group_start, group_end, device_id))
+            group_start = register.address
+        group_end = register_end
+
+    snapshot.update(read_range(client, group_start, group_end, device_id))
+    return snapshot
+
+
 def decode_float32(low_word: int, high_word: int) -> float:
     """Decode a word-swapped, big-endian IEEE 754 float."""
     raw = struct.pack(">HH", high_word, low_word)
     return struct.unpack(">f", raw)[0]
 
 
-def render_monitor(snapshot: dict[int, int]) -> str:
+def render_monitor(snapshot: dict[int, int], registers: tuple[Register, ...]) -> str:
     """Render known values from one raw register snapshot."""
     lines = ["Register  Value          Unit  Description", "-" * 62]
-    for register in MONITOR_REGISTERS:
-        if register.data_type == "uint16":
+    for register in registers:
+        if register.size == 1:
             value: int | float = snapshot[register.address]
         else:
             value = decode_float32(
@@ -151,7 +192,9 @@ def changed_registers(
     ]
 
 
-def print_changes(changes: list[tuple[int, int, int]]) -> None:
+def print_changes(
+    changes: list[tuple[int, int, int]], register_labels: dict[int, str]
+) -> None:
     if not changes:
         print("No register changes detected.")
         return
@@ -162,26 +205,26 @@ def print_changes(changes: list[tuple[int, int, int]]) -> None:
         print(
             f"{address:<9} {before:>5} (0x{before:04X})  "
             f"{after:>5} (0x{after:04X})  {after - before:+6d}  "
-            f"{REGISTER_LABELS.get(address, 'Unknown')}"
+            f"{register_labels.get(address, 'Unknown')}"
         )
 
 
 def monitor(client: ModbusTcpClient, args: argparse.Namespace) -> None:
-    start = min(register.address for register in MONITOR_REGISTERS)
-    end = max(
-        register.address + (1 if register.data_type == "float32" else 0)
-        for register in MONITOR_REGISTERS
-    )
+    registers = build_registers(args.inverter_model)
     while True:
-        snapshot = read_range(client, start, end, args.device_id)
+        snapshot = read_mapped_registers(client, registers, args.device_id)
         print("\033[2J\033[H", end="")
-        print(render_monitor(snapshot))
+        print(render_monitor(snapshot, registers))
         if args.once:
             return
         time.sleep(args.interval)
 
 
 def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
+    register_labels = {
+        register.address: register.label
+        for register in build_registers(args.inverter_model)
+    }
     print(
         f"Reading holding registers {args.start}-{args.end}. "
         "This mode never writes to the device."
@@ -195,7 +238,7 @@ def discover(client: ModbusTcpClient, args: argparse.Namespace) -> None:
     while True:
         input()
         current = read_range(client, args.start, args.end, args.device_id)
-        print_changes(changed_registers(baseline, current))
+        print_changes(changed_registers(baseline, current), register_labels)
         baseline = current
         print("Baseline updated. Make another app change, then press Enter.")
 
@@ -207,6 +250,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("host", help="PowerOcean IP address or hostname")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID)
+    parser.add_argument(
+        "--inverter-model",
+        type=const.InverterModel,
+        choices=tuple(const.InverterModel),
+        default=const.DEFAULT_INVERTER_MODEL,
+        help=f"register-map model (default: {const.DEFAULT_INVERTER_MODEL.value})",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     monitor_parser = subparsers.add_parser("monitor", help="Monitor known registers")
