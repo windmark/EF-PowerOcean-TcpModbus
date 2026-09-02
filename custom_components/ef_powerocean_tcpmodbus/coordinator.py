@@ -39,6 +39,9 @@ from .const import (
     DEVICE_INFO_BLOCK,
     DOMAIN,
     FIRMWARE_VERSION,
+    HEARTBEAT_INTERVAL_S,
+    HEARTBEAT_REGISTER,
+    HEARTBEAT_VALUE,
     MAX_BATTERY_CHARGED_POWER,
     MAX_BATTERY_DISCHARGED_POWER,
     PRODUCT_CATEGORY,
@@ -119,6 +122,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
+        self._last_heartbeat_time: datetime | None = None
+        # None until the device has answered once, so an unsupported model is logged once.
+        self._heartbeat_supported: bool | None = None
         self._energy_processor = EnergyProcessor(self.limits)
         self._status: CoordinatorStatus | None = None
         self._store: Store[dict[str, Any]] | None = Store(
@@ -140,6 +146,15 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             self.serial_number,
             self._last_inverter_temperature,
         )
+
+    @property
+    def heartbeat_supported(self) -> bool | None:
+        """Return whether the device accepts the heartbeat, or None if untested."""
+        return self._heartbeat_supported
+
+    @property
+    def last_heartbeat_time(self) -> datetime | None:
+        return self._last_heartbeat_time
 
     def get_pymodbus_version(self) -> str:
         return pyModbusVersion
@@ -263,12 +278,61 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
             return res.registers
 
+    async def async_send_heartbeat(self, *, force: bool = False) -> bool:
+        """Refresh Modbus control authority. Never raises; a miss only costs authority."""
+        if self._heartbeat_supported is False:
+            return False
+
+        now = dt.now()
+        if (
+            not force
+            and self._last_heartbeat_time is not None
+            and (now - self._last_heartbeat_time).total_seconds() < HEARTBEAT_INTERVAL_S
+        ):
+            return True
+
+        try:
+            async with self._lock:
+                response = await self._client.write_register(
+                    address=HEARTBEAT_REGISTER,
+                    value=HEARTBEAT_VALUE,
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            # Transport trouble, not a verdict on the register: retry next poll.
+            _LOGGER.debug(f"Heartbeat write failed: {err!r}")
+            return False
+
+        if response.isError():
+            if self._heartbeat_supported is None:
+                _LOGGER.warning(
+                    "Heartbeat register %s rejected by the device (%s). Writes will "
+                    "be acknowledged but may never take effect on this model.",
+                    HEARTBEAT_REGISTER,
+                    response,
+                )
+            self._heartbeat_supported = False
+            return False
+
+        if self._heartbeat_supported is None:
+            _LOGGER.info(
+                "Heartbeat register %s accepted; Modbus control authority is being "
+                "refreshed every %ss.",
+                HEARTBEAT_REGISTER,
+                HEARTBEAT_INTERVAL_S,
+            )
+        self._heartbeat_supported = True
+        self._last_heartbeat_time = now
+        return True
+
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
 
         # ── Check Connection, if not -> start reconnection ──
         if not self._client.connected and not await self.async_reconnect():
             raise UpdateFailed("Reconnect failed!")
+
+        await self.async_send_heartbeat()
 
         try:
             # Read all register blocks
@@ -358,6 +422,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         register_address = entity_def.register
         key = entity_def.read_key
 
+        # The device silently ignores writes when control authority has lapsed.
+        await self.async_send_heartbeat(force=True)
+
         _LOGGER.debug(
             "Sending Modbus write command [FC6]: value %s to address %s (Key: %s, Device ID: %s)",
             target_value,
@@ -404,7 +471,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
 
             _LOGGER.info(
-                "Register %s [%s] successfully updated to value: %s",
+                "Register %s [%s] acknowledged value: %s (the device may still ignore "
+                "it; confirm the effect, not the readback)",
                 register_address,
                 key,
                 target_value,

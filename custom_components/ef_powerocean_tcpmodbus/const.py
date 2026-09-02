@@ -58,6 +58,13 @@ MAX_FAULT_EVENTS: Final = 20
 
 SLEEP_TIME_AFTER_RECONNECT_S: Final = 1
 SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S: Final = 15
+
+# The device stores writes but acts on none of them unless this register is written
+# at least once a minute. Sent well inside that window so a missed poll is harmless.
+HEARTBEAT_REGISTER: Final = 40608
+HEARTBEAT_INTERVAL_S: Final = 20
+HEARTBEAT_VALUE: Final = 1
+
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
 STATE_SAVE_DELAY_S: Final = 30
