@@ -94,6 +94,16 @@ class GridMode(StrEnum):
     ISLANDED = "islanded"
 
 
+class ControlMode(StrEnum):
+    """Control method the device follows, reported by System State 2."""
+
+    DEFAULT = "default"
+    SYSTEM_FEED = "system_feed"
+    INVERTER_FEED = "inverter_feed"
+    BATTERY_LIMITS = "battery_limits"
+    UNKNOWN = "unknown"
+
+
 class RegisterType(StrEnum):
     """Word layout of a register. Multi-word values are stored low word first."""
 

@@ -89,6 +89,7 @@ class CalculateValuesTest(unittest.TestCase):
             "pv3_current": 3.0,
             "pv3_voltage": 250.0,
             "system_modes": 0b101000,
+            "system_state_2": (2 << 7) | 0b101000,
         }
 
     def calculate(
@@ -126,10 +127,20 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertFalse(result["self_use_mode_ena"])
         self.assertTrue(result["intelligent_mode_ena"])
 
+    def test_decodes_control_mode_bits(self) -> None:
+        self.assertEqual(self.calculate()["control_mode"], "inverter_feed")
+
+        self.data["system_state_2"] = 0
+        self.assertEqual(self.calculate()["control_mode"], "default")
+
+        self.data["system_state_2"] = 0b1111 << 7
+        self.assertEqual(self.calculate()["control_mode"], "unknown")
+
     def test_omits_optional_values_when_their_inputs_are_disabled_or_absent(
         self,
     ) -> None:
         del self.data["system_modes"]
+        del self.data["system_state_2"]
 
         result = self.calculate(calculate_solar_power=False)
 
@@ -138,6 +149,7 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertNotIn("battery_saver_mode_ena", result)
         self.assertNotIn("self_use_mode_ena", result)
         self.assertNotIn("intelligent_mode_ena", result)
+        self.assertNotIn("control_mode", result)
 
     def test_returns_none_when_required_inputs_are_missing(self) -> None:
         del self.data["battery_soc"]

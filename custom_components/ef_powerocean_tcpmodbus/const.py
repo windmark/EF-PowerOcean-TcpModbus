@@ -17,6 +17,7 @@ from homeassistant.const import (
 
 from .models import (
     BinarySensorDef,
+    ControlMode,
     CoordinatorStatus,
     EnergySensorDef,
     GridMode,
@@ -89,6 +90,7 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
     RegisterDef("battery_soc", 40527, RegisterType.UINT16),
     RegisterDef("inverter_rated_power", 40528, RegisterType.UINT32),
     RegisterDef("system_modes", 40530, RegisterType.UINT32),
+    RegisterDef("system_state_2", 40532, RegisterType.UINT32),
     RegisterDef("min_soc_limit", 40536, RegisterType.UINT16),
     RegisterDef("feed_in_power_max", 40538, RegisterType.UINT32),
     RegisterDef("device_led_brightness", 40541, RegisterType.UINT16),
@@ -146,6 +148,13 @@ SENSOR_MAP: list[SensorDef] = [
         unit=None,
         device_class=None,
         state_class="measurement",
+    ),
+    SensorDef(
+        key="system_state_2",
+        unit=None,
+        device_class=None,
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     SensorDef(
         key="house_power",
@@ -416,6 +425,13 @@ SENSOR_MAP: list[SensorDef] = [
         device_class="enum",
         options=tuple(OperatingMode),
         icon="mdi:home-lightning-bolt",
+    ),
+    SensorDef(
+        key="control_mode",
+        device_class="enum",
+        options=tuple(ControlMode),
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:remote",
     ),
     SensorDef(
         key="fault_count",
