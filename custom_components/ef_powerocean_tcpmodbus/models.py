@@ -95,13 +95,40 @@ class GridMode(StrEnum):
 
 
 class ControlMode(StrEnum):
-    """Control method the device follows, reported by System State 2."""
+    """Control method the device follows.
+
+    Commanded through bits 4-7 of the System Control Command (0x0215) and reported
+    back through bits 7-10 of System State 2 (0x0213). Both use the same numbering.
+    """
 
     DEFAULT = "default"
     SYSTEM_FEED = "system_feed"
     INVERTER_FEED = "inverter_feed"
     BATTERY_LIMITS = "battery_limits"
     UNKNOWN = "unknown"
+
+    @property
+    def command_value(self) -> int | None:
+        """Return the protocol enumeration value, or None if not commandable."""
+        return {
+            ControlMode.DEFAULT: 0,
+            ControlMode.SYSTEM_FEED: 1,
+            ControlMode.INVERTER_FEED: 2,
+            ControlMode.BATTERY_LIMITS: 3,
+        }.get(self)
+
+    @classmethod
+    def from_command_value(cls, value: int) -> ControlMode:
+        """Map a protocol enumeration value to a mode, UNKNOWN if unrecognised."""
+        for mode in cls:
+            if mode.command_value == value:
+                return mode
+        return cls.UNKNOWN
+
+    @classmethod
+    def selectable(cls) -> tuple[ControlMode, ...]:
+        """Return the modes a user may command."""
+        return tuple(mode for mode in cls if mode.command_value is not None)
 
 
 class RegisterType(StrEnum):
@@ -122,6 +149,32 @@ REGISTER_SIZES: Final = {
     # 16 ASCII bytes.
     RegisterType.SERIAL: 8,
 }
+
+
+def encode_register(value: int, data_type: RegisterType) -> list[int]:
+    """Return the raw words for writing *value*, low word first.
+
+    Mirrors the word order the read path decodes, and the protocol note that a
+    UINT32 0x12345678 travels as 0x5678 0x1234. Raises ValueError when the value
+    does not fit the type or the type cannot be written.
+    """
+    if data_type is RegisterType.UINT16:
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"{value} does not fit a UINT16 register")
+        return [value]
+
+    if data_type is RegisterType.UINT32:
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"{value} does not fit a UINT32 register")
+        word = value
+    elif data_type is RegisterType.INT32:
+        if not -0x80000000 <= value <= 0x7FFFFFFF:
+            raise ValueError(f"{value} does not fit an INT32 register")
+        word = value & 0xFFFFFFFF
+    else:
+        raise ValueError(f"Registers of type {data_type} cannot be written")
+
+    return [word & 0xFFFF, (word >> 16) & 0xFFFF]
 
 
 @dataclass(frozen=True)
@@ -241,6 +294,15 @@ class SwitchDef:
 
 
 @dataclass(frozen=True)
+class SelectDef:
+    key: str
+    options: tuple[str, ...]
+    name: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class NumberWritableDef:
     key: str  # Unique key for the number entity (e.g., "min_soc_limit_control")
     read_key: str  # The original key from MODBUS_REGISTERS used for reading (e.g., "min_soc_limit")
@@ -249,6 +311,14 @@ class NumberWritableDef:
     min_value: float  # Slider minimum value
     max_value: float  # Slider maximum value
     step: float  # Step size (1.0 for integers, 0.1 for floats)
+    data_type: RegisterType = RegisterType.UINT16  # Word layout used for the write
     unit: str | None = None  # Unit of measurement
     device_class: str | None = None  # Device class type
     icon: str | None = None  # Custom icon for the slider
+    # Control method the device must be following for this value to have any effect.
+    requires_control_method: ControlMode | None = None
+
+    @property
+    def size(self) -> int:
+        """Return how many 16-bit words the write occupies."""
+        return REGISTER_SIZES[self.data_type]
