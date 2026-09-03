@@ -367,6 +367,14 @@
       "device_led_brightness_control": {
         "name": "LED Brightness Control"
       }
+    },
+    "switch": {
+      "heartbeat_ena": {
+        "name": "Modbus Heartbeat"
+      },
+      "battery_saver_mode_control": {
+        "name": "Power-saving Mode Control"
+      }
     }
   }
 }

@@ -8,7 +8,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import EcoflowCoordinator
-from .models import BinarySensorDef, EnergySensorDef, SensorDef
+from .models import (
+    BinarySensorDef,
+    EnergySensorDef,
+    NumberWritableDef,
+    SensorDef,
+    SwitchDef,
+)
 
 
 class EcoFlowBaseEntity(CoordinatorEntity[EcoflowCoordinator]):
@@ -16,7 +22,11 @@ class EcoFlowBaseEntity(CoordinatorEntity[EcoflowCoordinator]):
         self,
         coordinator: EcoflowCoordinator,
         entry: ConfigEntry,
-        definition: SensorDef | EnergySensorDef | BinarySensorDef,
+        definition: SensorDef
+        | EnergySensorDef
+        | BinarySensorDef
+        | NumberWritableDef
+        | SwitchDef,
     ) -> None:
         super().__init__(coordinator)
         self._entry_id = entry.entry_id
