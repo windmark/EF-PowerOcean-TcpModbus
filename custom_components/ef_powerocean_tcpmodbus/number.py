@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from homeassistant.components.number import NumberEntity
+from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -16,6 +17,9 @@ from .entity import EcoFlowBaseEntity
 from .models import NumberWritableDef
 
 _LOGGER = logging.getLogger(__name__)
+
+# Ranges wider than this get a text box; a slider over tens of kilowatts is unusable.
+SLIDER_MAX_RANGE = 1000
 
 
 async def async_setup_entry(
@@ -35,7 +39,7 @@ async def async_setup_entry(
 
 
 class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
-    """Generic configuration slider entity dynamically driven by NumberWritableDef specifications."""
+    """Generic configuration entity dynamically driven by NumberWritableDef specifications."""
 
     def __init__(
         self,
@@ -43,7 +47,7 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
         entry: ConfigEntry,
         definition: NumberWritableDef,
     ) -> None:
-        """Initialize the generic number slider entity."""
+        """Initialize the generic number entity."""
         super().__init__(coordinator, entry, definition)
 
         # Track the last written value to prevent redundant state updates
@@ -55,8 +59,13 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
         self._attr_native_step = definition.step
         self._attr_native_unit_of_measurement = definition.unit
         self._attr_device_class = definition.device_class
+        self._attr_mode = (
+            NumberMode.BOX
+            if definition.max_value - definition.min_value > SLIDER_MAX_RANGE
+            else NumberMode.SLIDER
+        )
 
-        # Categorize writeable management controls into the diagnostic section of the UI
+        # Categorize writeable management controls into the config section of the UI
         self._attr_entity_category = EntityCategory.CONFIG
 
         if definition.icon:
@@ -76,7 +85,8 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
         new_value = self.native_value
         if new_value != self._last_written_value:
             self._last_written_value = new_value
-            self.async_write_ha_state()
+        # Attributes (active control method) change independently of the value.
+        self.async_write_ha_state()
 
     @property
     def native_value(self) -> float | None:
@@ -90,9 +100,22 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
                 return float(val)
         return self._last_written_value
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        required = self._definition.requires_control_method
+        if required is None:
+            return None
+        reported = self.coordinator.reported_control_method()
+        return {
+            "requires_control_method": str(required),
+            "control_method_active": reported is required
+            if reported is not None
+            else None,
+        }
+
     async def async_set_native_value(self, value: float) -> None:
         """Set new value asynchronously (overrides NumberEntity abstract method)."""
         await self.coordinator.async_write_modbus_register(
             entity_def=self._definition,
-            value=int(value),
+            value=int(round(value)),
         )
