@@ -29,6 +29,8 @@ from .const import (
     CONF_MAX_SOLAR_POWER,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
+    CONTROL_COMMAND_REGISTER,
+    CONTROL_COMMAND_UNSAFE_BITS,
     DEFAULT_BATTERY_COUNT,
     DEFAULT_INVERTER_MODEL,
     DEFAULT_MAX_GRID_POWER,
@@ -123,6 +125,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
         self._last_heartbeat_time: datetime | None = None
+        self._heartbeat_enabled = True
         # None until the device has answered once, so an unsupported model is logged once.
         self._heartbeat_supported: bool | None = None
         self._energy_processor = EnergyProcessor(self.limits)
@@ -151,6 +154,10 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     def heartbeat_supported(self) -> bool | None:
         """Return whether the device accepts the heartbeat, or None if untested."""
         return self._heartbeat_supported
+
+    @property
+    def heartbeat_enabled(self) -> bool:
+        return self._heartbeat_enabled
 
     @property
     def last_heartbeat_time(self) -> datetime | None:
@@ -280,7 +287,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
     async def async_send_heartbeat(self, *, force: bool = False) -> bool:
         """Refresh Modbus control authority. Never raises; a miss only costs authority."""
-        if self._heartbeat_supported is False:
+        if not self._heartbeat_enabled or self._heartbeat_supported is False:
             return False
 
         now = dt.now()
@@ -324,6 +331,61 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._heartbeat_supported = True
         self._last_heartbeat_time = now
         return True
+
+    async def async_set_heartbeat_enabled(self, enabled: bool) -> None:
+        """Turn the heartbeat on or off at runtime, without reloading the entry."""
+        if enabled == self._heartbeat_enabled:
+            return
+
+        self._heartbeat_enabled = enabled
+        self._last_heartbeat_time = None
+        if enabled:
+            # Re-probe, so an earlier rejection does not survive a manual retry.
+            self._heartbeat_supported = None
+            await self.async_send_heartbeat(force=True)
+
+        _LOGGER.info("Modbus heartbeat %s", "enabled" if enabled else "disabled")
+        self.async_update_listeners()
+
+    async def async_write_control_command(self, value: int) -> None:
+        """Write the write-only system control command register."""
+        if value & CONTROL_COMMAND_UNSAFE_BITS:
+            raise HomeAssistantError(
+                f"Refusing control command 0x{value:08X}: it would take the system "
+                "off-grid or shut it down."
+            )
+
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
+
+        await self.async_send_heartbeat(force=True)
+
+        _LOGGER.debug(
+            "Sending Modbus write command [FC16]: 0x%08X to address %s (Device ID: %s)",
+            value,
+            CONTROL_COMMAND_REGISTER,
+            self._client_slave_id,
+        )
+
+        try:
+            async with self._lock:
+                response = await self._client.write_registers(
+                    address=CONTROL_COMMAND_REGISTER,
+                    values=[value & 0xFFFF, (value >> 16) & 0xFFFF],
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(
+                f"Control command 0x{value:08X} could not be sent: {err!r}"
+            ) from err
+
+        if response.isError():
+            raise HomeAssistantError(
+                f"Modbus rejected control command 0x{value:08X}: {response}"
+            )
+
+        # The register cannot be read back, so the effect only shows in the next poll.
+        await self.async_request_refresh()
 
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}

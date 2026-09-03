@@ -22,6 +22,7 @@ def coordinator():
     instance._last_checked_time = None
     instance._last_heartbeat_time = None
     instance._heartbeat_supported = None
+    instance._heartbeat_enabled = True
     instance._client = Mock()
     instance._client_slave_id = 1
     instance._lock = asyncio.Lock()
@@ -142,6 +143,93 @@ def test_transport_failure_retries_instead_of_disabling_the_heartbeat(
     write = heartbeat_response(coordinator, is_error=False)
     assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is True
     assert write.await_count == 1
+
+
+def test_disabling_the_heartbeat_stops_it_and_re_enabling_re_probes(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=True)
+    coordinator.async_update_listeners = Mock()
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+
+    # A rejection latches the heartbeat off until something re-probes it.
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch)
+    assert coordinator.heartbeat_supported is False
+
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator.async_set_heartbeat_enabled(False))
+    assert coordinator.heartbeat_enabled is False
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert write.await_count == 1
+
+    write = heartbeat_response(coordinator, is_error=False)
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator.async_set_heartbeat_enabled(True))
+
+    assert coordinator.heartbeat_enabled is True
+    assert coordinator.heartbeat_supported is True
+    assert write.await_count == 1
+
+
+def write_control_command(coordinator, value: int):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_write_control_command(value))
+
+
+@pytest.mark.parametrize(
+    "value",
+    (0b1, 0b10, 0b1011),
+    ids=("off-grid", "shutdown", "power-saving-plus-shutdown"),
+)
+def test_control_command_refuses_off_grid_and_shutdown_bits(
+    coordinator, value: int
+) -> None:
+    coordinator._client.write_registers = AsyncMock()
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        write_control_command(coordinator, value)
+
+    coordinator._client.write_registers.assert_not_awaited()
+
+
+def test_control_command_writes_both_words_low_word_first(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+    coordinator._client.connected = True
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+    coordinator._client.write_registers = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+    coordinator.async_request_refresh = AsyncMock()
+
+    write_control_command(coordinator, 1 << const.CONTROL_COMMAND_POWER_SAVING_BIT)
+
+    coordinator._client.write_registers.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0008, 0x0000],
+        device_id=1,
+    )
+    # The register is write-only, so the effect has to come from the next poll.
+    coordinator.async_request_refresh.assert_awaited_once()
+
+
+def test_control_command_raises_when_the_device_rejects_it(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+    coordinator._client.connected = True
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+    coordinator._client.write_registers = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=True))
+    )
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        write_control_command(coordinator, 1 << const.CONTROL_COMMAND_POWER_SAVING_BIT)
 
 
 @pytest.mark.parametrize(

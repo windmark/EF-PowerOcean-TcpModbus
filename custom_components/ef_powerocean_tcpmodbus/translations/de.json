@@ -366,6 +366,14 @@
       "device_led_brightness_control": {
         "name": "Helligkeit LED-Geräteanzeige Steuerung"
       }
+    },
+    "switch": {
+      "heartbeat_ena": {
+        "name": "Modbus-Heartbeat"
+      },
+      "battery_saver_mode_control": {
+        "name": "Batteriesparmodus Steuerung"
+      }
     }
   }
 }

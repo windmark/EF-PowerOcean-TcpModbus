@@ -28,6 +28,7 @@ from .models import (
     RegisterDef,
     RegisterType,
     SensorDef,
+    SwitchDef,
     plan_blocks,
 )
 
@@ -64,6 +65,12 @@ SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S: Final = 15
 HEARTBEAT_REGISTER: Final = 40608
 HEARTBEAT_INTERVAL_S: Final = 20
 HEARTBEAT_VALUE: Final = 1
+
+# 0x0215, write-only. Bit 0 forces the system off-grid and bit 1 shuts it down, so a
+# command touching either is refused before it reaches the wire.
+CONTROL_COMMAND_REGISTER: Final = 40534
+CONTROL_COMMAND_UNSAFE_BITS: Final = 0b11
+CONTROL_COMMAND_POWER_SAVING_BIT: Final = 3
 
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
@@ -544,6 +551,21 @@ BINARY_SENSOR_MAP: list[BinarySensorDef] = [
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 ]
+
+
+# Local toggle, not a device register: it gates whether the heartbeat is sent at all.
+HEARTBEAT_SWITCH: Final = SwitchDef(
+    key="heartbeat_ena",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:heart-pulse",
+)
+
+# Written as a bit of the control command register; read back as battery_saver_mode_ena.
+POWER_SAVING_SWITCH: Final = SwitchDef(
+    key="battery_saver_mode_control",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:leaf",
+)
 
 
 # Map of all modbus registers available for writing operations.

@@ -230,6 +230,15 @@ class BinarySensorDef:
 
 
 @dataclass(frozen=True)
+class SwitchDef:
+    key: str
+    name: str | None = None
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class NumberWritableDef:
     key: str  # Unique key for the number entity (e.g., "min_soc_limit_control")
     read_key: str  # The original key from MODBUS_REGISTERS used for reading (e.g., "min_soc_limit")
