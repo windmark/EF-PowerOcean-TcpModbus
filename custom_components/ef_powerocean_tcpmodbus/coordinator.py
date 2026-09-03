@@ -126,6 +126,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_checked_time: datetime | None = None
         self._last_heartbeat_time: datetime | None = None
         self._heartbeat_enabled = True
+        # Re-sent every poll: the device drops functions that stop being asserted.
+        self._control_command = 0
         # None until the device has answered once, so an unsupported model is logged once.
         self._heartbeat_supported: bool | None = None
         self._energy_processor = EnergyProcessor(self.limits)
@@ -158,6 +160,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     @property
     def heartbeat_enabled(self) -> bool:
         return self._heartbeat_enabled
+
+    @property
+    def control_command(self) -> int:
+        """Return the control command word currently being asserted."""
+        return self._control_command
 
     @property
     def last_heartbeat_time(self) -> datetime | None:
@@ -359,7 +366,13 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError("Modbus client is not connected")
 
         await self.async_send_heartbeat(force=True)
+        await self._async_write_control_word(value)
+        self._control_command = value
 
+        # Read back through a full poll: the register itself cannot be read.
+        await self.async_refresh()
+
+    async def _async_write_control_word(self, value: int) -> None:
         _LOGGER.debug(
             "Sending Modbus write command [FC16]: 0x%08X to address %s (Device ID: %s)",
             value,
@@ -384,8 +397,30 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 f"Modbus rejected control command 0x{value:08X}: {response}"
             )
 
-        # The register cannot be read back, so the effect only shows in the next poll.
-        await self.async_request_refresh()
+    async def _async_reassert_control_command(self) -> None:
+        """Re-send the active command so the device does not time it out."""
+        if not self._control_command:
+            return
+
+        try:
+            await self._async_write_control_word(self._control_command)
+        except HomeAssistantError as err:
+            _LOGGER.debug(f"Control command re-assert failed: {err!r}")
+
+    def _log_state_word_changes(self, data: dict[str, Any]) -> None:
+        """Trace the raw status words, so any reaction to a command is visible."""
+        for key in ("system_modes", "system_state_2"):
+            new_value = data.get(key)
+            previous = self._last_checked_data.get(key)
+            if new_value is None or new_value == previous:
+                continue
+            _LOGGER.debug(
+                "%s changed 0x%08X -> 0x%08X (commanding 0x%08X)",
+                key,
+                int(previous or 0),
+                int(new_value),
+                self._control_command,
+            )
 
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -395,6 +430,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             raise UpdateFailed("Reconnect failed!")
 
         await self.async_send_heartbeat()
+        await self._async_reassert_control_command()
 
         try:
             # Read all register blocks
@@ -459,6 +495,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 result, self._last_checked_data, is_daily_reset=is_daily_reset
             )
 
+            self._log_state_word_changes(result)
             self._last_checked_data = dict(result)
             self._last_checked_time = dt.now()
             self._status = CoordinatorStatus.SUCCESS

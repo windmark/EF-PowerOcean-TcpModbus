@@ -23,6 +23,7 @@ def coordinator():
     instance._last_heartbeat_time = None
     instance._heartbeat_supported = None
     instance._heartbeat_enabled = True
+    instance._control_command = 0
     instance._client = Mock()
     instance._client_slave_id = 1
     instance._lock = asyncio.Lock()
@@ -203,7 +204,7 @@ def test_control_command_writes_both_words_low_word_first(
     coordinator._client.write_registers = AsyncMock(
         return_value=Mock(isError=Mock(return_value=False))
     )
-    coordinator.async_request_refresh = AsyncMock()
+    coordinator.async_refresh = AsyncMock()
 
     write_control_command(coordinator, 1 << const.CONTROL_COMMAND_POWER_SAVING_BIT)
 
@@ -213,7 +214,8 @@ def test_control_command_writes_both_words_low_word_first(
         device_id=1,
     )
     # The register is write-only, so the effect has to come from the next poll.
-    coordinator.async_request_refresh.assert_awaited_once()
+    coordinator.async_refresh.assert_awaited_once()
+    assert coordinator.control_command == 0b1000
 
 
 def test_control_command_raises_when_the_device_rejects_it(
@@ -230,6 +232,46 @@ def test_control_command_raises_when_the_device_rejects_it(
 
     with pytest.raises(coordinator_module.HomeAssistantError):
         write_control_command(coordinator, 1 << const.CONTROL_COMMAND_POWER_SAVING_BIT)
+
+
+def reassert_control_command(coordinator) -> None:
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator._async_reassert_control_command())
+
+
+def test_active_control_command_is_re_asserted_every_poll(coordinator) -> None:
+    coordinator._control_command = 0b1000
+    coordinator._client.write_registers = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+
+    reassert_control_command(coordinator)
+
+    coordinator._client.write_registers.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0008, 0x0000],
+        device_id=1,
+    )
+
+
+def test_cleared_control_command_is_not_re_asserted(coordinator) -> None:
+    coordinator._control_command = 0
+    coordinator._client.write_registers = AsyncMock()
+
+    reassert_control_command(coordinator)
+
+    coordinator._client.write_registers.assert_not_awaited()
+
+
+def test_re_assert_failure_does_not_break_the_poll(coordinator) -> None:
+    coordinator._control_command = 0b1000
+    coordinator._client.write_registers = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+
+    reassert_control_command(coordinator)
+
+    assert coordinator.control_command == 0b1000
 
 
 @pytest.mark.parametrize(

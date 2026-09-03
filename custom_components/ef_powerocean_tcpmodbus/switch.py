@@ -90,6 +90,15 @@ class EcoFlowPowerSavingSwitch(EcoFlowSwitch):
             return None
         return self.coordinator.data.get("battery_saver_mode_ena")
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        return {
+            "commanded_word": f"0x{self.coordinator.control_command:08X}",
+            "system_modes_raw": data.get("system_modes"),
+            "system_state_2_raw": data.get("system_state_2"),
+        }
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self._async_write(enabled=True)
 

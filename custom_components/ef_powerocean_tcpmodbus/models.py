@@ -109,6 +109,7 @@ class RegisterType(StrEnum):
 
     UINT16 = "uint16"
     UINT32 = "uint32"
+    INT32 = "int32"
     FLOAT32 = "float32"
     SERIAL = "serial"
 
@@ -116,6 +117,7 @@ class RegisterType(StrEnum):
 REGISTER_SIZES: Final = {
     RegisterType.UINT16: 1,
     RegisterType.UINT32: 2,
+    RegisterType.INT32: 2,
     RegisterType.FLOAT32: 2,
     # 16 ASCII bytes.
     RegisterType.SERIAL: 8,
