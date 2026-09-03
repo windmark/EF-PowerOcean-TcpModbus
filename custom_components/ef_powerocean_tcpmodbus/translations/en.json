@@ -375,6 +375,26 @@
       },
       "device_led_brightness_control": {
         "name": "LED Brightness Control"
+      },
+      "system_power_setpoint_control": {
+        "name": "System Power Setpoint Control"
+      },
+      "inverter_power_setpoint_control": {
+        "name": "Inverter Power Setpoint Control"
+      },
+      "battery_power_setpoint_control": {
+        "name": "Battery Power Setpoint Control"
+      }
+    },
+    "select": {
+      "control_method_control": {
+        "name": "Control Method",
+        "state": {
+          "default": "Default",
+          "system_feed": "System feed-in/draw",
+          "inverter_feed": "Inverter feed-in/draw",
+          "battery_limits": "Battery charge/discharge limits"
+        }
       }
     },
     "switch": {
