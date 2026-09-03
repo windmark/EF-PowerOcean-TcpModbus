@@ -116,11 +116,15 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
         address_overrides={InverterModel.POWEROCEAN_PLUS: 40538},
     ),
     RegisterDef("device_led_brightness", 40541, RegisterType.UINT16),
+    # Setpoints that take effect the moment the matching control method is engaged.
+    RegisterDef("system_power_setpoint", 40542, RegisterType.INT32),
+    RegisterDef("inverter_power_setpoint", 40544, RegisterType.INT32),
     RegisterDef("limit_inv_power", 40546, RegisterType.UINT32),
     RegisterDef("limit_inv_max", 40548, RegisterType.UINT32),
     RegisterDef("battery_capacity", 40552, RegisterType.UINT32),
     RegisterDef("battery_discharge_power_limit", 40554, RegisterType.UINT32),
     RegisterDef("battery_charge_power_limit", 40556, RegisterType.UINT32),
+    RegisterDef("battery_power_setpoint", 40571, RegisterType.INT32),
     RegisterDef("battery_voltage", 40574),
     RegisterDef("battery_current", 40576),
     RegisterDef("battery_temperature", 40578),
@@ -480,6 +484,20 @@ SENSOR_MAP: list[SensorDef] = [
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:remote",
     ),
+    *[
+        SensorDef(
+            key=key,
+            unit=UnitOfPower.WATT,
+            device_class="power",
+            state_class="measurement",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for key in (
+            "system_power_setpoint",
+            "inverter_power_setpoint",
+            "battery_power_setpoint",
+        )
+    ],
     SensorDef(
         key="fault_count",
         state_class="measurement",
