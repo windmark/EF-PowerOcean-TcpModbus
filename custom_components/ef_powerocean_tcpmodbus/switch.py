@@ -10,12 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import (
-    CONTROL_COMMAND_POWER_SAVING_BIT,
-    DOMAIN,
-    HEARTBEAT_SWITCH,
-    POWER_SAVING_SWITCH,
-)
+from .const import DOMAIN, HEARTBEAT_SWITCH, POWER_SAVING_SWITCH
 from .coordinator import EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
 from .models import SwitchDef
@@ -82,30 +77,31 @@ class EcoFlowHeartbeatSwitch(EcoFlowSwitch):
 
 
 class EcoFlowPowerSavingSwitch(EcoFlowSwitch):
-    """Power-saving mode, written as a bit of the write-only control command."""
+    """Power-saving mode, bit 3 of the write-only control command.
+
+    The coordinator composes the control word from this bit and the selected
+    control method, so toggling here no longer resets the method to Default.
+    """
 
     @property
     def is_on(self) -> bool | None:
-        if self.coordinator.data is None:
-            return None
-        return self.coordinator.data.get("battery_saver_mode_ena")
+        data = self.coordinator.data
+        if data is None or data.get("battery_saver_mode_ena") is None:
+            return self.coordinator.power_saving_commanded
+        return data.get("battery_saver_mode_ena")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         return {
+            "commanded": self.coordinator.power_saving_commanded,
             "commanded_word": f"0x{self.coordinator.control_command:08X}",
             "system_modes_raw": data.get("system_modes"),
             "system_state_2_raw": data.get("system_state_2"),
         }
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._async_write(enabled=True)
+        await self.coordinator.async_set_power_saving(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._async_write(enabled=False)
-
-    async def _async_write(self, *, enabled: bool) -> None:
-        await self.coordinator.async_write_control_command(
-            1 << CONTROL_COMMAND_POWER_SAVING_BIT if enabled else 0
-        )
+        await self.coordinator.async_set_power_saving(False)
