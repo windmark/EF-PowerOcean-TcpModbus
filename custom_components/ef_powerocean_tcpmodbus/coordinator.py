@@ -46,6 +46,7 @@ from .const import (
     DOMAIN,
     FIRMWARE_VERSION,
     HEARTBEAT_INTERVAL_S,
+    HEARTBEAT_LAPSE_S,
     HEARTBEAT_REGISTER,
     HEARTBEAT_VALUE,
     MAX_BATTERY_CHARGED_POWER,
@@ -60,6 +61,7 @@ from .const import (
     STORAGE_VERSION,
     SYSTEM_STATE_2_CONTROL_MODE_MASK,
     SYSTEM_STATE_2_CONTROL_MODE_SHIFT,
+    SYSTEM_STATUS_LOW_POWER_BIT,
 )
 from .energy_processor import EnergyProcessor
 from .models import (
@@ -149,6 +151,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._power_saving = False
         self._last_control_write_time: datetime | None = None
         self._control_mismatch_logged = False
+        # Set when control authority may have lapsed; the next poll re-sends the word.
+        self._control_stale = False
 
         self._energy_processor = EnergyProcessor(self.limits)
         self._status: CoordinatorStatus | None = None
@@ -218,6 +222,18 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             (int(state) >> SYSTEM_STATE_2_CONTROL_MODE_SHIFT)
             & SYSTEM_STATE_2_CONTROL_MODE_MASK
         )
+
+    def reported_low_power(self, data: dict[str, Any] | None = None) -> bool | None:
+        """Return whether the device reports low-power mode as engaged, if read.
+
+        This is a status bit: it only goes high once the inverter has actually gone
+        idle, so it cannot confirm or deny the commanded power-saving switch.
+        """
+        source = data if data is not None else self.data
+        state = (source or {}).get("system_modes")
+        if state is None:
+            return None
+        return bool((int(state) >> SYSTEM_STATUS_LOW_POWER_BIT) & 1)
 
     def get_pymodbus_version(self) -> str:
         return pyModbusVersion
@@ -327,6 +343,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                     # the next heartbeat at once and let the read-back re-assert the
                     # command if it was dropped.
                     self._last_heartbeat_time = None
+                    self._control_stale = True
                     await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT_S)
                     return True
                 self._client.close()
@@ -363,12 +380,17 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             return False
 
         now = dt.now()
-        if (
-            not force
-            and self._last_heartbeat_time is not None
-            and (now - self._last_heartbeat_time).total_seconds() < HEARTBEAT_INTERVAL_S
-        ):
-            return True
+        if self._last_heartbeat_time is not None:
+            since_last = (now - self._last_heartbeat_time).total_seconds()
+            if not force and since_last < HEARTBEAT_INTERVAL_S:
+                return True
+            if since_last > HEARTBEAT_LAPSE_S:
+                _LOGGER.debug(
+                    "Heartbeat gap of %.0fs exceeded the device window; the control "
+                    "word will be re-sent",
+                    since_last,
+                )
+                self._control_stale = True
 
         try:
             async with self._lock:
@@ -414,6 +436,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         if enabled:
             # Re-probe, so an earlier rejection does not survive a manual retry.
             self._heartbeat_supported = None
+            # The device released control while the heartbeat was off.
+            self._control_stale = True
             await self.async_send_heartbeat(force=True)
 
         _LOGGER.info("Modbus heartbeat %s", "enabled" if enabled else "disabled")
@@ -490,6 +514,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         await self._async_write_control_word(value)
         self._last_control_write_time = dt.now()
         self._control_mismatch_logged = False
+        self._control_stale = False
         self.async_update_listeners()
 
         # The register itself cannot be read; System State 2 is the read-back. The
@@ -522,11 +547,13 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 f"Modbus rejected control command 0x{value:08X}: {response}"
             )
 
-    def _adopt_reported_control_method(self, data: dict[str, Any]) -> None:
-        """On the first read, take over the method the device is already following.
+    def _adopt_reported_state(self, data: dict[str, Any]) -> None:
+        """On the first read, take over what the device is already doing.
 
         After a restart the device is still running the last commanded method, so
         starting from Default would misreport the state and would never restore it.
+        Power saving is seeded from the low-power status bit, the only hint there
+        is; it is a best guess because that bit is only set once the inverter idles.
         """
         if self._control_method_adopted:
             return
@@ -535,20 +562,53 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             return
         self._control_method = reported
         self._control_method_adopted = True
-        if reported is not ControlMode.DEFAULT:
-            _LOGGER.info("Adopted control method %s reported by the device", reported)
+        if (low_power := self.reported_low_power(data)) is not None:
+            self._power_saving = low_power
+        if reported is not ControlMode.DEFAULT or self._power_saving:
+            _LOGGER.info(
+                "Adopted device state: control method %s, power saving %s",
+                reported,
+                self._power_saving,
+            )
 
     async def _async_reconcile_control_command(self, data: dict[str, Any]) -> None:
-        """Re-send the control word only when the device reports it is not following it.
+        """Keep the device on the commanded word without blindly re-writing it.
 
+        Two cases warrant a write: control authority lapsed (the device then falls
+        back to the app settings, so anything commanded, including power saving, is
+        gone), or the device reports a control method other than the commanded one.
         Blindly re-writing every poll forced the method back to Default around any
-        manual change and, if bit 3 is edge-triggered, toggled power saving each poll.
+        manual change and, if bit 3 were edge-triggered, toggled power saving.
         """
-        if self._control_method is ControlMode.DEFAULT:
-            # Nothing that needs holding; power saving alone has no reliable read-back.
-            return
         if not self._heartbeat_enabled or self._heartbeat_supported is False:
             # Without authority the device will not follow anyway; don't fight it.
+            return
+        if not self._control_method_adopted:
+            return
+
+        commanding_something = (
+            self._control_method is not ControlMode.DEFAULT or self._power_saving
+        )
+
+        if self._control_stale:
+            if not commanding_something:
+                self._control_stale = False
+                return
+            word = self._compose_control_command()
+            _LOGGER.info(
+                "Re-sending control word 0x%08X after a control-authority lapse", word
+            )
+            try:
+                await self._async_write_control_word(word)
+            except HomeAssistantError as err:
+                _LOGGER.debug(f"Control command re-send failed: {err!r}")
+                return
+            self._last_control_write_time = dt.now()
+            self._control_stale = False
+            return
+
+        if self._control_method is ControlMode.DEFAULT:
+            # Nothing that needs holding; power saving alone has no reliable read-back.
             return
 
         reported = self.reported_control_method(data)
@@ -636,7 +696,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S)
                 return None
 
-            self._adopt_reported_control_method(data)
+            self._adopt_reported_state(data)
             await self._async_reconcile_control_command(data)
 
             return data
