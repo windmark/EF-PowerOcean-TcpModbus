@@ -27,6 +27,7 @@ from .models import (
     RegisterBlock,
     RegisterDef,
     RegisterType,
+    SelectDef,
     SensorDef,
     SwitchDef,
     plan_blocks,
@@ -67,10 +68,23 @@ HEARTBEAT_INTERVAL_S: Final = 20
 HEARTBEAT_VALUE: Final = 1
 
 # 0x0215, write-only. Bit 0 forces the system off-grid and bit 1 shuts it down, so a
-# command touching either is refused before it reaches the wire.
+# command touching either is refused before it reaches the wire. Bit 3 is the
+# power-saving switch and bits 4-7 select the control method; the setpoint registers
+# only take effect while their control method is selected here.
 CONTROL_COMMAND_REGISTER: Final = 40534
 CONTROL_COMMAND_UNSAFE_BITS: Final = 0b11
 CONTROL_COMMAND_POWER_SAVING_BIT: Final = 3
+CONTROL_COMMAND_METHOD_SHIFT: Final = 4
+CONTROL_COMMAND_METHOD_MASK: Final = 0xF
+
+# System State 2 (0x0213) reports the control method the device is actually
+# following in bits 7-10. It is the only read-back the write-only command has.
+SYSTEM_STATE_2_CONTROL_MODE_SHIFT: Final = 7
+SYSTEM_STATE_2_CONTROL_MODE_MASK: Final = 0xF
+
+# A commanded control method the device stops reporting is sent again, but no more
+# often than this, so a slow device is not hammered and a toggle bit is not flipped.
+CONTROL_COMMAND_REASSERT_INTERVAL_S: Final = 30
 
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
@@ -578,11 +592,19 @@ HEARTBEAT_SWITCH: Final = SwitchDef(
     icon="mdi:heart-pulse",
 )
 
-# Written as a bit of the control command register; read back as battery_saver_mode_ena.
+# Written as bit 3 of the control command register; read back as battery_saver_mode_ena.
 POWER_SAVING_SWITCH: Final = SwitchDef(
     key="battery_saver_mode_control",
     entity_category=EntityCategory.CONFIG,
     icon="mdi:leaf",
+)
+
+# Written as bits 4-7 of the control command register; read back as control_mode.
+CONTROL_METHOD_SELECT: Final = SelectDef(
+    key="control_method_control",
+    options=tuple(ControlMode.selectable()),
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:remote",
 )
 
 
@@ -609,5 +631,49 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         step=10.0,
         unit=UnitOfRatio.PERCENTAGE,
         icon="mdi:led-on",
+    ),
+    # Setpoints. Positive draws from the grid / charges, negative feeds / discharges.
+    # Each is inert until the matching control method is selected.
+    NumberWritableDef(
+        key="system_power_setpoint_control",
+        read_key="system_power_setpoint",
+        name="System Power Setpoint",
+        register=REGISTERS_BY_KEY["system_power_setpoint"].address,
+        min_value=-DEFAULT_MAX_POWER,
+        max_value=DEFAULT_MAX_POWER,
+        step=10.0,
+        data_type=RegisterType.INT32,
+        unit=UnitOfPower.WATT,
+        device_class="power",
+        icon="mdi:transmission-tower",
+        requires_control_method=ControlMode.SYSTEM_FEED,
+    ),
+    NumberWritableDef(
+        key="inverter_power_setpoint_control",
+        read_key="inverter_power_setpoint",
+        name="Inverter Power Setpoint",
+        register=REGISTERS_BY_KEY["inverter_power_setpoint"].address,
+        min_value=-DEFAULT_MAX_POWER,
+        max_value=DEFAULT_MAX_POWER,
+        step=10.0,
+        data_type=RegisterType.INT32,
+        unit=UnitOfPower.WATT,
+        device_class="power",
+        icon="mdi:sine-wave",
+        requires_control_method=ControlMode.INVERTER_FEED,
+    ),
+    NumberWritableDef(
+        key="battery_power_setpoint_control",
+        read_key="battery_power_setpoint",
+        name="Battery Power Setpoint",
+        register=REGISTERS_BY_KEY["battery_power_setpoint"].address,
+        min_value=-DEFAULT_MAX_POWER,
+        max_value=DEFAULT_MAX_POWER,
+        step=10.0,
+        data_type=RegisterType.INT32,
+        unit=UnitOfPower.WATT,
+        device_class="power",
+        icon="mdi:battery-charging",
+        requires_control_method=ControlMode.BATTERY_LIMITS,
     ),
 ]
