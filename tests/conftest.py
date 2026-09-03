@@ -27,6 +27,7 @@ homeassistant_const.Platform = type(
         "SENSOR": "sensor",
         "NUMBER": "number",
         "SWITCH": "switch",
+        "SELECT": "select",
     },
 )
 homeassistant_const.EntityCategory = StrEnum(
