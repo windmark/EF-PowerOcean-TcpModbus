@@ -66,6 +66,9 @@ SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S: Final = 15
 HEARTBEAT_REGISTER: Final = 40608
 HEARTBEAT_INTERVAL_S: Final = 20
 HEARTBEAT_VALUE: Final = 1
+# The device's own window. A gap longer than this means it has dropped Modbus
+# control and re-inherited the app settings, so the control word is sent again.
+HEARTBEAT_LAPSE_S: Final = 60
 
 # 0x0215, write-only. Bit 0 forces the system off-grid and bit 1 shuts it down, so a
 # command touching either is refused before it reaches the wire. Bit 3 is the
@@ -76,6 +79,11 @@ CONTROL_COMMAND_UNSAFE_BITS: Final = 0b11
 CONTROL_COMMAND_POWER_SAVING_BIT: Final = 3
 CONTROL_COMMAND_METHOD_SHIFT: Final = 4
 CONTROL_COMMAND_METHOD_MASK: Final = 0xF
+
+# System Status (0x0211) bit 3 reports whether low-power (power-saving) mode is
+# currently engaged. It is a status, not an echo of the command bit: while the
+# battery is working it stays 0 even if power saving is enabled.
+SYSTEM_STATUS_LOW_POWER_BIT: Final = 3
 
 # System State 2 (0x0213) reports the control method the device is actually
 # following in bits 7-10. It is the only read-back the write-only command has.
