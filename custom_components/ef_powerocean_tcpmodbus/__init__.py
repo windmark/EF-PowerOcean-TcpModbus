@@ -21,6 +21,7 @@ PLATFORMS: Final = [
     Platform.SENSOR,
     Platform.NUMBER,
     Platform.SWITCH,
+    Platform.SELECT,
 ]
 WARNING_TRANSLATION_PREFIX: Final = f"component.{DOMAIN}.config.step.warning"
 
