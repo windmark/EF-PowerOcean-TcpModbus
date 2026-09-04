@@ -53,6 +53,11 @@ class EcoFlowControlIntentSelect(EcoFlowBaseEntity, SelectEntity):
             self._attr_icon = definition.icon
 
     @property
+    def available(self) -> bool:
+        # The device only acts on a mode while the heartbeat holds Modbus control.
+        return super().available and self.coordinator.heartbeat_enabled
+
+    @property
     def current_option(self) -> str | None:
         return str(self.coordinator.control_intent)
 
