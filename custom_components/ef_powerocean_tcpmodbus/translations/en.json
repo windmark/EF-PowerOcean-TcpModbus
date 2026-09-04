@@ -374,15 +374,6 @@
       },
       "device_led_brightness_control": {
         "name": "LED Brightness Control"
-      },
-      "system_power_setpoint_control": {
-        "name": "System Power Setpoint Control"
-      },
-      "inverter_power_setpoint_control": {
-        "name": "Inverter Power Setpoint Control"
-      },
-      "battery_power_setpoint_control": {
-        "name": "Battery Power Setpoint Control"
       }
     },
     "select": {
