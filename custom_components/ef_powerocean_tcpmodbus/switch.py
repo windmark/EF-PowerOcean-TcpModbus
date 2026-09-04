@@ -51,17 +51,16 @@ class EcoFlowSwitch(EcoFlowBaseEntity, SwitchEntity):
 
 
 class EcoFlowHeartbeatSwitch(EcoFlowSwitch):
-    """Manual override for the keepalive that grants Modbus control authority.
+    """Takes Modbus control of the inverter, which the control mode needs.
 
-    The control mode arms and releases this on its own, so it is off the entity list
-    unless someone enables it to debug or to hold control open deliberately.
+    While this is on the EcoFlow app cannot control the system; while it is off the
+    control mode and its power are unavailable. Settings that apply without control
+    authority, such as the LED brightness and power saving, are unaffected either way.
     """
-
-    _attr_entity_registry_enabled_default = False
 
     @property
     def available(self) -> bool:
-        # Stays operable while disconnected so the keepalive can be armed beforehand.
+        # Stays operable while disconnected so control can be given up regardless.
         return True
 
     @property
@@ -87,24 +86,21 @@ class EcoFlowPowerSavingSwitch(EcoFlowSwitch):
     """Power-saving mode, bit 3 of the write-only control command.
 
     The coordinator composes the control word from this bit and the selected control
-    mode, so toggling here never disturbs the mode. It arms the heartbeat by itself.
+    mode, so toggling here never disturbs the mode.
     """
 
     @property
-    def is_on(self) -> bool | None:
-        data = self.coordinator.data
-        if data is None or data.get("battery_saver_mode_ena") is None:
-            return self.coordinator.power_saving_commanded
-        return data.get("battery_saver_mode_ena")
+    def is_on(self) -> bool:
+        # System Modes bit 3 is a status, not an echo: it only rises once the
+        # inverter has actually gone idle, so it cannot confirm the command.
+        return self.coordinator.power_saving_commanded
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         return {
-            "commanded": self.coordinator.power_saving_commanded,
+            "device_reports_low_power": data.get("battery_saver_mode_ena"),
             "commanded_word": f"0x{self.coordinator.control_command:08X}",
-            "system_modes_raw": data.get("system_modes"),
-            "system_state_2_raw": data.get("system_state_2"),
         }
 
     async def async_turn_on(self, **kwargs: Any) -> None:

@@ -601,8 +601,8 @@ MODBUS_CONTROL_BINARY_SENSOR: Final = BinarySensorDef(
     entity_category=EntityCategory.DIAGNOSTIC,
 )
 
-# Local toggle, not a device register: it gates whether the heartbeat is sent at all.
-# The control intent arms and releases it, so this is only for debugging.
+# Local toggle, not a device register: it gates whether the heartbeat is sent, and
+# with it whether the control mode may command the inverter at all.
 HEARTBEAT_SWITCH: Final = SwitchDef(
     key="heartbeat_ena",
     entity_category=EntityCategory.CONFIG,

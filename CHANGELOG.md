@@ -23,10 +23,17 @@
 
 ### Changed
 
-- The heartbeat is armed and released by the control mode. The Modbus Heartbeat
-  switch is now disabled by default and kept only for debugging.
-- The power ceiling for each mode comes from the device's own limit registers.
-- The minimum SOC limit is disabled by default: the PowerOcean Plus ignores it.
+- The **Modbus Heartbeat** switch is the single gate on commanding. While it is on
+  the EcoFlow app cannot control the system and the control mode is usable; while
+  it is off both the control mode and its power are unavailable. Nothing arms or
+  drops it automatically.
+- Power saving, LED brightness and the minimum SOC limit apply without Modbus
+  control, so they work whatever the heartbeat is doing.
+- The **Power-saving Mode** switch reports what was commanded. It used to report
+  System Modes bit 3, which is a status that only rises once the inverter idles, so
+  the switch appeared to ignore the first press.
+- The power ceiling for each mode comes from the device's own limit registers and
+  never exceeds the inverter's AC rating. Control Power is a slider in 100 W steps.
 
 ### Removed
 

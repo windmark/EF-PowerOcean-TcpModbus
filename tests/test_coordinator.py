@@ -340,11 +340,40 @@ def test_engaging_an_intent_takes_control_and_automatic_releases_it(
     coordinator._heartbeat_enabled = False
     coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
 
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+    assert coordinator.heartbeat_enabled is False
+
+
+def test_commanding_a_mode_never_takes_control_by_itself(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat switch is the user's gate; nothing arms or drops it for them."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+
     set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
     assert coordinator.heartbeat_enabled is True
 
     set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
-    assert coordinator.heartbeat_enabled is False
+    assert coordinator.heartbeat_enabled is True
+
+
+def test_setting_power_needs_modbus_control(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+    coordinator._heartbeat_enabled = False
+    write.reset_mock()
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_power(coordinator, 1000)
+
+    write.assert_not_awaited()
 
 
 def test_seeding_refuses_rather_than_commanding_zero(
@@ -364,7 +393,7 @@ def test_seeding_refuses_rather_than_commanding_zero(
 def test_returning_to_automatic_works_while_disconnected(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Releasing needs no write: the device reverts once the heartbeat stops."""
+    """Dropping the mode needs no write: the device reverts on its own anyway."""
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
     set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
@@ -373,10 +402,9 @@ def test_returning_to_automatic_works_while_disconnected(
     set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
 
     assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
-    assert coordinator.heartbeat_enabled is False
 
 
-def test_a_failing_clear_still_releases_control(
+def test_a_failing_clear_still_drops_the_mode(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     allow_writes(coordinator, monkeypatch)
@@ -389,7 +417,6 @@ def test_a_failing_clear_still_releases_control(
     set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
 
     assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
-    assert coordinator.heartbeat_enabled is False
 
 
 def test_re_selecting_automatic_writes_nothing(
@@ -419,7 +446,39 @@ def test_disabling_the_heartbeat_always_succeeds(
 
     assert coordinator.heartbeat_enabled is False
     assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
-    assert coordinator.power_saving_commanded is False
+    # Power saving does not need control authority, so it survives the release.
+    assert coordinator.power_saving_commanded is True
+
+
+def test_power_saving_does_not_take_control_from_the_app(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bit 3 applies like the LED does; only a control method locks the app out."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+
+    set_power_saving(coordinator, True)
+
+    assert coordinator.power_saving_commanded is True
+    assert coordinator.heartbeat_enabled is False
+    write.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0000, 0x0008],
+        device_id=1,
+    )
+
+
+def test_power_saving_keeps_the_control_method_in_the_word(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    set_power_saving(coordinator, True)
+
+    assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0038]
+    assert coordinator.control_intent is models.ControlIntent.CHARGE_BATTERY
 
 
 def test_control_command_raises_when_the_device_rejects_it(
@@ -443,16 +502,31 @@ def test_control_word_is_re_sent_after_a_control_authority_lapse(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write = allow_writes(coordinator, monkeypatch)
-    coordinator._power_saving = True
+    coordinator._control_intent = models.ControlIntent.CHARGE_BATTERY
+    coordinator._control_power = 0.0
     coordinator._control_stale = True
 
     reconcile(coordinator, {"system_state_2": 0})
 
-    write.assert_awaited_once_with(
-        address=const.CONTROL_COMMAND_REGISTER,
-        values=[0x0000, 0x0008],
-        device_id=1,
-    )
+    assert write.await_args_list[-1].kwargs == {
+        "address": const.CONTROL_COMMAND_REGISTER,
+        "values": [0x0000, 0x0030],
+        "device_id": 1,
+    }
+    assert coordinator._control_stale is False
+
+
+def test_power_saving_alone_is_not_re_sent_after_a_lapse(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It never depended on the heartbeat, so a lapse does not disturb it."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._power_saving = True
+    coordinator._control_stale = True
+
+    reconcile(coordinator, {})
+
+    write.assert_not_awaited()
     assert coordinator._control_stale is False
 
 

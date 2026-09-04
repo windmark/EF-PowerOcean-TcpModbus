@@ -473,11 +473,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return True
 
     async def async_set_heartbeat_enabled(self, enabled: bool) -> None:
-        """Turn the heartbeat on or off at runtime, without reloading the entry.
+        """Take or give up Modbus control. This is the user's gate on commanding.
 
-        Turning it off is the escape hatch, so it never fails: everything commanded
-        is dropped and the device hands control back on its own once the heartbeat
-        stops, whether or not the clearing write gets through.
+        Turning it off never fails: the control mode is dropped and the device hands
+        control back on its own once the heartbeat stops, whether or not the clearing
+        write gets through. Power saving is left alone, as it needs no authority.
         """
         if enabled == self._heartbeat_enabled:
             return
@@ -491,7 +491,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             self._control_stale = True
             await self.async_send_heartbeat(force=True)
         else:
-            self._power_saving = False
             await self._async_stop_commanding(ControlIntent.AUTOMATIC)
             self._heartbeat_enabled = False
             self._last_heartbeat_time = None
@@ -499,37 +498,27 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Modbus heartbeat %s", "enabled" if enabled else "disabled")
         self.async_update_listeners()
 
+    def _require_modbus_control(self) -> None:
+        """Refuse a command the device would store and ignore."""
+        if not self._heartbeat_enabled:
+            raise HomeAssistantError(
+                "Modbus control is off. Turn on the Modbus Heartbeat switch to "
+                "command the inverter; nothing was written."
+            )
+
     async def _async_require_control_authority(self) -> None:
-        """Take control of the device, so the write that follows is acted on.
+        """Confirm the device is still following us before the write that follows.
 
         The device stores every write but only acts on it while the heartbeat is
-        current, so the heartbeat is armed on demand rather than left to the user.
+        current, so a command sent without one looks successful and does nothing.
         """
-        if not self._heartbeat_enabled:
-            self._heartbeat_enabled = True
-            self._heartbeat_supported = None
-            self._last_heartbeat_time = None
-            _LOGGER.info("Taking Modbus control: the EcoFlow app will lose control")
+        self._require_modbus_control()
 
         if not await self.async_send_heartbeat(force=True):
             raise HomeAssistantError(
                 f"Heartbeat write to register {HEARTBEAT_REGISTER} failed or was "
                 "rejected, so the device would ignore the command. Nothing written."
             )
-
-    def _release_control_authority(self) -> None:
-        """Stop the heartbeat when nothing is commanded, giving the app control back.
-
-        Releasing needs no I/O: the device reverts to the app by itself once the
-        heartbeat stops, which is why this can never fail.
-        """
-        if not self._heartbeat_enabled or self._power_saving:
-            return
-        if self._control_intent is not ControlIntent.AUTOMATIC:
-            return
-        self._heartbeat_enabled = False
-        self._last_heartbeat_time = None
-        _LOGGER.info("Releasing Modbus control back to the EcoFlow app")
 
     def _compose_control_command(self) -> int:
         """Build the control word from the commanded intent and power-saving state.
@@ -571,6 +560,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             await self._async_stop_commanding(intent)
             return
 
+        self._require_modbus_control()
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
 
@@ -592,10 +582,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self.async_update_listeners()
 
     async def _async_stop_commanding(self, intent: ControlIntent) -> None:
-        """Hand the inverter back to itself. Never raises.
+        """Return to automatic. Never raises.
 
-        The clearing write is best effort because it is not what actually releases
-        the device: stopping the heartbeat does, after the device's own timeout.
+        The clearing write is best effort: if it does not get through, the device
+        falls back to the app by itself once the heartbeat stops. Modbus control
+        itself is left as the user set it.
         """
         already_idle = self._control_intent is intent
         self._control_intent = intent
@@ -612,7 +603,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                     HEARTBEAT_LAPSE_S,
                 )
 
-        self._release_control_authority()
         self.async_update_listeners()
 
     async def async_set_control_power(self, watts: float) -> None:
@@ -622,6 +612,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError(
                 "Select a control mode other than automatic before setting a power"
             )
+        self._require_modbus_control()
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
 
@@ -684,7 +675,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         except HomeAssistantError:
             self._power_saving = previous
             raise
-        self._release_control_authority()
 
     async def _async_apply_control_command(self) -> None:
         """Write the composed control word once and refresh so the read-back shows it."""
@@ -697,7 +687,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
 
-        await self._async_require_control_authority()
+        # Power saving applies on its own, like the LED brightness does. Only a
+        # control method needs the app locked out, so only it takes control.
+        if CONTROL_INTENTS[self._control_intent].controls_power:
+            await self._async_require_control_authority()
+
         await self._async_write_control_word(value)
         self._last_control_write_time = dt.now()
         self._control_stale = False
@@ -743,7 +737,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             return
 
         definition = CONTROL_INTENTS[self._control_intent]
-        if not definition.controls_power and not self._power_saving:
+        if not definition.controls_power:
             self._control_stale = False
             return
 

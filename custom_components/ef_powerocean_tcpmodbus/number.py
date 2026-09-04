@@ -68,9 +68,10 @@ class EcoFlowControlPowerNumber(EcoFlowBaseEntity, NumberEntity):
 
     @property
     def available(self) -> bool:
-        # Nothing to target while the inverter is running itself.
+        # Nothing to target unless Modbus control is held and a mode is selected.
         return (
             super().available
+            and self.coordinator.heartbeat_enabled
             and self.coordinator.control_intent is not ControlIntent.AUTOMATIC
         )
 
