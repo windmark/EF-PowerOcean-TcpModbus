@@ -665,17 +665,19 @@ CONTROL_INTENT_SELECT: Final = SelectDef(
 )
 
 # One number for every intent. Its meaning and ceiling follow the selected intent,
-# and it is unavailable while the inverter is running itself.
+# and it is unavailable while the inverter is running itself. The step is coarse
+# enough to drag across a whole inverter's range; the device slews far slower than
+# 100 W of precision would buy.
 CONTROL_POWER_NUMBER: Final = ControlPowerDef(
     key="control_power_control",
-    step=10.0,
+    step=100.0,
     unit=UnitOfPower.WATT,
     device_class="power",
     entity_category=EntityCategory.CONFIG,
     icon="mdi:speedometer",
 )
 
-# Fallback ceiling for an intent whose limit register is missing or reads zero.
+# Ceiling for an intent whose limit registers are all missing or read zero.
 CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
 
 

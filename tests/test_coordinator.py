@@ -300,6 +300,34 @@ def test_control_power_is_clamped_to_the_device_limit(
     assert coordinator.control_power == 3000.0
 
 
+def test_no_mode_may_exceed_the_inverter_rating(coordinator) -> None:
+    """The AC rating bounds the slider whatever a mode's own limit says."""
+    coordinator.data = {
+        "inverter_rated_power": 11000.0,
+        "battery_charge_power_limit": 25000.0,
+        "feed_in_power_max": 9000.0,
+    }
+    coordinator.limits[const.CONF_MAX_GRID_POWER] = 15000
+
+    ceilings = {
+        intent: coordinator._control_power_ceiling(intent)
+        for intent in models.ControlIntent
+    }
+
+    assert ceilings[models.ControlIntent.CHARGE_BATTERY] == 11000.0
+    assert ceilings[models.ControlIntent.IMPORT_FROM_GRID] == 11000.0
+    # A tighter published limit still wins over the rating.
+    assert ceilings[models.ControlIntent.EXPORT_TO_GRID] == 9000.0
+
+
+def test_ceiling_falls_back_when_the_device_publishes_nothing(coordinator) -> None:
+    coordinator.data = {"inverter_rated_power": 0.0}
+
+    ceiling = coordinator._control_power_ceiling(models.ControlIntent.CHARGE_BATTERY)
+
+    assert ceiling == float(const.CONTROL_POWER_FALLBACK_MAX)
+
+
 def test_control_power_is_refused_while_automatic(coordinator) -> None:
     with pytest.raises(coordinator_module.HomeAssistantError):
         set_control_power(coordinator, 1000)

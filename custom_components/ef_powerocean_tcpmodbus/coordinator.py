@@ -215,16 +215,27 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return self._control_power_ceiling(self._control_intent)
 
     def _control_power_ceiling(self, intent: ControlIntent) -> float:
+        """Return the lowest ceiling that applies to *intent*.
+
+        Nothing can exceed the inverter's AC rating whatever the mode asks for, and
+        the device's own per-mode limit caps it further where one is published.
+        """
+        data = self.data or {}
         definition = CONTROL_INTENTS[intent]
-        if definition.limit_key is not None:
-            limit = (self.data or {}).get(definition.limit_key)
-            if limit:
-                return float(limit)
+        ceilings = [float(CONTROL_POWER_FALLBACK_MAX)]
+
+        if definition.limit_key is not None and (
+            limit := data.get(definition.limit_key)
+        ):
+            ceilings.append(float(limit))
         if intent is ControlIntent.IMPORT_FROM_GRID:
-            return float(
-                self.limits.get(CONF_MAX_GRID_POWER, CONTROL_POWER_FALLBACK_MAX)
+            ceilings.append(
+                float(self.limits.get(CONF_MAX_GRID_POWER, CONTROL_POWER_FALLBACK_MAX))
             )
-        return float(CONTROL_POWER_FALLBACK_MAX)
+        if rated := data.get("inverter_rated_power"):
+            ceilings.append(float(rated))
+
+        return min(ceilings)
 
     @property
     def in_control(self) -> bool:
