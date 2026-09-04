@@ -26,10 +26,13 @@
 - The heartbeat is armed and released by the control mode. The Modbus Heartbeat
   switch is now disabled by default and kept only for debugging.
 - The power ceiling for each mode comes from the device's own limit registers.
-- The three raw setpoint numbers and the minimum SOC limit are disabled by default.
+- The minimum SOC limit is disabled by default: the PowerOcean Plus ignores it.
 
 ### Removed
 
+- **System / Inverter / Battery Power Setpoint** number entities. The control mode
+  writes the right setpoint register for the selected mode, so a value can no
+  longer be written to a register the device is ignoring.
 - **Control Mode** sensor. It read System State 2 (0x0213), which is not
   implemented on the PowerOcean Plus and always reported "default".
 

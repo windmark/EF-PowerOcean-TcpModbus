@@ -368,10 +368,7 @@ class NumberWritableDef:
     unit: str | None = None  # Unit of measurement
     device_class: str | None = None  # Device class type
     icon: str | None = None  # Custom icon for the slider
-    # Control method the device must be following for this value to have any effect.
-    requires_control_method: ControlMode | None = None
-    # Raw register access that the control intent already covers: kept for experts,
-    # hidden from the entity list unless someone enables it.
+    # Not implemented on every model: hidden from the entity list unless enabled.
     advanced: bool = False
 
     @property

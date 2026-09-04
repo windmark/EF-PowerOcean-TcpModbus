@@ -858,10 +858,10 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_write_modbus_register(
         self, entity_def: NumberWritableDef, value: int
     ) -> None:
-        """Write a parameter or setpoint register and verify it by reading it back.
+        """Write a device setting and verify it by reading it back.
 
-        UINT16 registers go out with FC6; INT32/UINT32 with FC16, high word first,
-        which is the order the device parses writes in (see `encode_register`).
+        Settings apply without Modbus control authority, unlike the control word and
+        its setpoints, so this never takes control away from the EcoFlow app.
         """
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
@@ -874,20 +874,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             words = encode_register(target_value, entity_def.data_type)
         except ValueError as err:
             raise HomeAssistantError(str(err)) from err
-
-        required = entity_def.requires_control_method
-        if required is not None:
-            if required is not self.control_method:
-                _LOGGER.warning(
-                    "%s only takes effect while the control method is %s, but %s is "
-                    "commanded. The value is stored; select the matching control "
-                    "mode for the device to act on it.",
-                    key,
-                    required,
-                    self.control_method,
-                )
-            # The device silently ignores setpoints when control authority has lapsed.
-            await self._async_require_control_authority()
 
         _LOGGER.debug(
             "Sending Modbus write command [%s]: value %s -> %s to address %s (Key: %s, Device ID: %s)",

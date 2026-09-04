@@ -374,15 +374,6 @@
       },
       "device_led_brightness_control": {
         "name": "Helligkeit LED-Geräteanzeige Steuerung"
-      },
-      "system_power_setpoint_control": {
-        "name": "Sollwert Systemleistung"
-      },
-      "inverter_power_setpoint_control": {
-        "name": "Sollwert Wechselrichterleistung"
-      },
-      "battery_power_setpoint_control": {
-        "name": "Sollwert Batterieleistung"
       }
     },
     "select": {

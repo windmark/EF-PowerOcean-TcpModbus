@@ -145,8 +145,7 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
         new_value = self.native_value
         if new_value != self._last_written_value:
             self._last_written_value = new_value
-        # Attributes (active control method) change independently of the value.
-        self.async_write_ha_state()
+            self.async_write_ha_state()
 
     @property
     def native_value(self) -> float | None:
@@ -159,19 +158,6 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
             if val is not None:
                 return float(val)
         return self._last_written_value
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        required = self._definition.requires_control_method
-        if required is None:
-            return None
-        reported = self.coordinator.reported_control_method()
-        return {
-            "requires_control_method": str(required),
-            "control_method_active": reported is required
-            if reported is not None
-            else None,
-        }
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value asynchronously (overrides NumberEntity abstract method)."""
