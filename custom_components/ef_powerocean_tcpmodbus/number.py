@@ -50,7 +50,7 @@ class EcoFlowControlPowerNumber(EcoFlowBaseEntity, NumberEntity):
     """
 
     _attr_native_min_value = 0.0
-    _attr_mode = NumberMode.BOX
+    _attr_mode = NumberMode.SLIDER
 
     def __init__(
         self,
