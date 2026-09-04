@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Writes are now acted on.** The inverter parses multi-register writes high word
+  first while publishing reads low word first, so every 32-bit write was received
+  multiplied by 65536: the control word arrived with an empty method nibble and the
+  inverter ignored it. Only 16-bit writes (LED brightness, heartbeat) ever worked.
+
+### Added
+
+- **Control Mode** select and a single **Control Power** number replace the control
+  method select and the three setpoint numbers. Each mode pins a control method and
+  the sign of its setpoint, so the power is always a positive magnitude and an
+  invalid combination cannot be expressed.
+- Engaging a mode seeds its setpoint from what the system is doing right now, so
+  switching mode never applies a stale value from a previous session.
+- **Modbus Control** binary sensor showing whether the inverter is actually
+  following this integration.
+- **Inverter Output Power** sensor, derived from house power less grid power.
+
+### Changed
+
+- The **Modbus Heartbeat** switch is the single gate on commanding. While it is on
+  the EcoFlow app cannot control the system and the control mode is usable; while
+  it is off both the control mode and its power are unavailable. Nothing arms or
+  drops it automatically.
+- Power saving, LED brightness and the minimum SOC limit apply without Modbus
+  control, so they work whatever the heartbeat is doing.
+- The **Power-saving Mode** switch reports what was commanded. It used to report
+  System Modes bit 3, which is a status that only rises once the inverter idles, so
+  the switch appeared to ignore the first press.
+- The power ceiling for each mode comes from the device's own limit registers and
+  never exceeds the inverter's AC rating. Control Power is a slider in 100 W steps.
+
+### Removed
+
+- **System / Inverter / Battery Power Setpoint** number entities. The control mode
+  writes the right setpoint register for the selected mode, so a value can no
+  longer be written to a register the device is ignoring.
+- **Control Mode** sensor. It read System State 2 (0x0213), which is not
+  implemented on the PowerOcean Plus and always reported "default".
+
 ## [2.4.0] - 2026-08-18
 
 ### Added

@@ -100,6 +100,18 @@
       "system_modes": {
         "name": "System Modes"
       },
+      "system_state_2": {
+        "name": "System Modes 2"
+      },
+      "system_power_setpoint": {
+        "name": "System Power Setpoint"
+      },
+      "inverter_power_setpoint": {
+        "name": "Inverter Power Setpoint"
+      },
+      "battery_power_setpoint": {
+        "name": "Battery Power Setpoint"
+      },
       "battery_count": {
         "name": "Battery Module Count"
       },
@@ -328,9 +340,15 @@
           "grid": "Grid-connected",
           "islanded": "Islanded"
         }
+      },
+      "inverter_output_power": {
+        "name": "Inverter Output Power"
       }
     },
     "binary_sensor": {
+      "modbus_control": {
+        "name": "Modbus Control"
+      },
       "self_use_mode_ena": {
         "name": "Self-powered Mode"
       },
@@ -348,11 +366,35 @@
       }
     },
     "number": {
+      "control_power_control": {
+        "name": "Control Power"
+      },
       "min_soc_limit_control": {
         "name": "Minimum SOC Limit Control"
       },
       "device_led_brightness_control": {
         "name": "LED Brightness Control"
+      }
+    },
+    "select": {
+      "control_mode_control": {
+        "name": "Control Mode",
+        "state": {
+          "automatic": "Automatic",
+          "charge_battery": "Charge battery at",
+          "discharge_battery": "Discharge battery at",
+          "import_from_grid": "Import from grid at",
+          "export_to_grid": "Export to grid at",
+          "limit_inverter_output": "Limit inverter output to"
+        }
+      }
+    },
+    "switch": {
+      "heartbeat_ena": {
+        "name": "Modbus Heartbeat"
+      },
+      "battery_saver_mode_control": {
+        "name": "Power-saving Mode Control"
       }
     }
   }

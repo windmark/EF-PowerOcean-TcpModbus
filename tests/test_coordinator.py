@@ -20,6 +20,17 @@ def coordinator():
     )
     instance._last_checked_data = {}
     instance._last_checked_time = None
+    instance._last_heartbeat_time = None
+    instance._heartbeat_supported = None
+    instance._heartbeat_enabled = True
+    instance._control_intent = models.ControlIntent.AUTOMATIC
+    instance._control_power = 0.0
+    instance._power_saving = False
+    instance._last_control_write_time = None
+    instance._control_stale = False
+    instance._client = Mock()
+    instance._client_slave_id = 1
+    instance._lock = asyncio.Lock()
     instance._status = None
     instance._store = None
     instance._ena_calc_solar_power = False
@@ -56,6 +67,514 @@ def run_update(
     coordinator.async_get_raw_data = AsyncMock(return_value=dict(raw_data))
     monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
     return asyncio.run(coordinator._async_update_data())
+
+
+HEARTBEAT_START = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def send_heartbeat(
+    coordinator,
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force: bool = False,
+) -> bool:
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
+    # asyncio.run() builds a fresh loop per call, and a lock binds to the first one.
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_send_heartbeat(force=force))
+
+
+def heartbeat_response(coordinator, *, is_error: bool) -> AsyncMock:
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=is_error))
+    )
+    return coordinator._client.write_register
+
+
+def test_heartbeat_is_sent_at_most_once_per_interval(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=False)
+    interval = const.HEARTBEAT_INTERVAL_S
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is True
+    assert coordinator.heartbeat_supported is True
+
+    too_soon = HEARTBEAT_START + timedelta(seconds=interval - 1)
+    assert send_heartbeat(coordinator, too_soon, monkeypatch) is True
+    assert write.await_count == 1
+
+    due = HEARTBEAT_START + timedelta(seconds=interval)
+    assert send_heartbeat(coordinator, due, monkeypatch) is True
+    assert write.await_count == 2
+
+
+def test_forced_heartbeat_before_a_write_ignores_the_interval(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=False)
+
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch)
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch, force=True)
+
+    assert write.await_count == 2
+
+
+def test_heartbeat_stops_once_the_device_rejects_the_register(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=True)
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert coordinator.heartbeat_supported is False
+
+    # A rejection latches it off for polling, but a user action still re-probes.
+    later = HEARTBEAT_START + timedelta(minutes=5)
+    assert send_heartbeat(coordinator, later, monkeypatch) is False
+    assert write.await_count == 1
+
+    assert send_heartbeat(coordinator, later, monkeypatch, force=True) is False
+    assert write.await_count == 2
+
+
+def test_transport_failure_retries_instead_of_disabling_the_heartbeat(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator._client.write_register = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert coordinator.heartbeat_supported is None
+    assert coordinator.last_heartbeat_time is None
+
+    write = heartbeat_response(coordinator, is_error=False)
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is True
+    assert write.await_count == 1
+
+
+def test_disabling_the_heartbeat_stops_it_and_re_enabling_re_probes(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=True)
+    coordinator.async_update_listeners = Mock()
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+
+    # A rejection latches the heartbeat off until something re-probes it.
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch)
+    assert coordinator.heartbeat_supported is False
+
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator.async_set_heartbeat_enabled(False))
+    assert coordinator.heartbeat_enabled is False
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert write.await_count == 1
+
+    write = heartbeat_response(coordinator, is_error=False)
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator.async_set_heartbeat_enabled(True))
+
+    assert coordinator.heartbeat_enabled is True
+    assert coordinator.heartbeat_supported is True
+    assert write.await_count == 1
+
+
+def set_power_saving(coordinator, enabled: bool):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_power_saving(enabled))
+
+
+def set_control_intent(coordinator, intent):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_control_intent(intent))
+
+
+def set_control_power(coordinator, watts: float):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_control_power(watts))
+
+
+def allow_writes(coordinator, monkeypatch: pytest.MonkeyPatch, *, is_error=False):
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+    coordinator._client.connected = True
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+    coordinator._client.write_registers = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=is_error))
+    )
+    coordinator.async_refresh = AsyncMock()
+    coordinator.async_update_listeners = Mock()
+    return coordinator._client.write_registers
+
+
+def test_control_command_refuses_off_grid_and_shutdown_bits(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    # Nothing composable through the public API sets them, so bend the bit to reach
+    # the guard: power saving now lands on BIT0, which takes the system off-grid.
+    monkeypatch.setattr(coordinator_module, "CONTROL_COMMAND_POWER_SAVING_BIT", 0)
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_power_saving(coordinator, True)
+
+    write.assert_not_awaited()
+
+
+def test_control_command_writes_both_words_high_word_first(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+
+    set_power_saving(coordinator, True)
+
+    # The device parses multi-register writes high word first, unlike its reads.
+    write.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0000, 0x0008],
+        device_id=1,
+    )
+    coordinator.async_refresh.assert_awaited_once()
+    assert coordinator.control_command == 0b1000
+
+
+def test_intent_composes_the_method_nibble_without_losing_power_saving(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._power_saving = True
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    assert write.await_args_list[-1].kwargs == {
+        "address": const.CONTROL_COMMAND_REGISTER,
+        "values": [0x0000, 0x0038],
+        "device_id": 1,
+    }
+
+
+def test_engaging_an_intent_seeds_the_setpoint_from_the_present_measurement(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entering a mode must not apply whatever the register held from last time."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 2500.0, "battery_charge_power_limit": 5000.0}
+
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    assert coordinator.control_power == 2500.0
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+    assert write.await_args_list[0].kwargs == {
+        "address": setpoint,
+        "values": [0x0000, 0x09C4],
+        "device_id": 1,
+    }
+
+
+def test_discharge_intent_sends_the_magnitude_as_a_negative_setpoint(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_discharge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.DISCHARGE_BATTERY)
+
+    set_control_power(coordinator, 1500)
+
+    assert coordinator.control_power == 1500.0
+    # -1500 as INT32, high word first.
+    assert write.await_args_list[-1].kwargs["values"] == [0xFFFF, 0xFA24]
+
+
+def test_control_power_is_clamped_to_the_device_limit(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 3000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    set_control_power(coordinator, 9999)
+
+    assert coordinator.control_power == 3000.0
+
+
+def test_no_mode_may_exceed_the_inverter_rating(coordinator) -> None:
+    """The AC rating bounds the slider whatever a mode's own limit says."""
+    coordinator.data = {
+        "inverter_rated_power": 11000.0,
+        "battery_charge_power_limit": 25000.0,
+        "feed_in_power_max": 9000.0,
+    }
+    coordinator.limits[const.CONF_MAX_GRID_POWER] = 15000
+
+    ceilings = {
+        intent: coordinator._control_power_ceiling(intent)
+        for intent in models.ControlIntent
+    }
+
+    assert ceilings[models.ControlIntent.CHARGE_BATTERY] == 11000.0
+    assert ceilings[models.ControlIntent.IMPORT_FROM_GRID] == 11000.0
+    # A tighter published limit still wins over the rating.
+    assert ceilings[models.ControlIntent.EXPORT_TO_GRID] == 9000.0
+
+
+def test_ceiling_falls_back_when_the_device_publishes_nothing(coordinator) -> None:
+    coordinator.data = {"inverter_rated_power": 0.0}
+
+    ceiling = coordinator._control_power_ceiling(models.ControlIntent.CHARGE_BATTERY)
+
+    assert ceiling == float(const.CONTROL_POWER_FALLBACK_MAX)
+
+
+def test_control_power_is_refused_while_automatic(coordinator) -> None:
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_power(coordinator, 1000)
+
+
+def test_engaging_an_intent_takes_control_and_automatic_releases_it(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+    assert coordinator.heartbeat_enabled is False
+
+
+def test_commanding_a_mode_never_takes_control_by_itself(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat switch is the user's gate; nothing arms or drops it for them."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+    assert coordinator.heartbeat_enabled is True
+
+    set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
+    assert coordinator.heartbeat_enabled is True
+
+
+def test_setting_power_needs_modbus_control(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+    coordinator._heartbeat_enabled = False
+    write.reset_mock()
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_power(coordinator, 1000)
+
+    write.assert_not_awaited()
+
+
+def test_seeding_refuses_rather_than_commanding_zero(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0 W is a shutdown, not a no-op, so a missing measurement must not seed it."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"inverter_rated_power": 10000.0}
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_control_intent(coordinator, models.ControlIntent.LIMIT_INVERTER_OUTPUT)
+
+    write.assert_not_awaited()
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+
+
+def test_returning_to_automatic_works_while_disconnected(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping the mode needs no write: the device reverts on its own anyway."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    coordinator._client.connected = False
+    set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
+
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+
+
+def test_a_failing_clear_still_drops_the_mode(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    coordinator._client.write_registers = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+    set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
+
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+
+
+def test_re_selecting_automatic_writes_nothing(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+
+    set_control_intent(coordinator, models.ControlIntent.AUTOMATIC)
+
+    write.assert_not_awaited()
+    assert coordinator.heartbeat_enabled is False
+
+
+def test_disabling_the_heartbeat_always_succeeds(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape hatch cannot depend on a write the device may never answer."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+    coordinator._power_saving = True
+    coordinator._client.connected = False
+
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator.async_set_heartbeat_enabled(False))
+
+    assert coordinator.heartbeat_enabled is False
+    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
+    # Power saving does not need control authority, so it survives the release.
+    assert coordinator.power_saving_commanded is True
+
+
+def test_power_saving_does_not_take_control_from_the_app(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bit 3 applies like the LED does; only a control method locks the app out."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+
+    set_power_saving(coordinator, True)
+
+    assert coordinator.power_saving_commanded is True
+    assert coordinator.heartbeat_enabled is False
+    write.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0000, 0x0008],
+        device_id=1,
+    )
+
+
+def test_power_saving_keeps_the_control_method_in_the_word(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
+    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
+
+    set_power_saving(coordinator, True)
+
+    assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0038]
+    assert coordinator.control_intent is models.ControlIntent.CHARGE_BATTERY
+
+
+def test_control_command_raises_when_the_device_rejects_it(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch, is_error=True)
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_power_saving(coordinator, True)
+
+    # The commanded state rolls back, so the UI does not claim a write that failed.
+    assert coordinator.power_saving_commanded is False
+
+
+def reconcile(coordinator, data: dict) -> None:
+    coordinator._lock = asyncio.Lock()
+    asyncio.run(coordinator._async_reconcile_control_command(data))
+
+
+def test_control_word_is_re_sent_after_a_control_authority_lapse(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._control_intent = models.ControlIntent.CHARGE_BATTERY
+    coordinator._control_power = 0.0
+    coordinator._control_stale = True
+
+    reconcile(coordinator, {"system_state_2": 0})
+
+    assert write.await_args_list[-1].kwargs == {
+        "address": const.CONTROL_COMMAND_REGISTER,
+        "values": [0x0000, 0x0030],
+        "device_id": 1,
+    }
+    assert coordinator._control_stale is False
+
+
+def test_power_saving_alone_is_not_re_sent_after_a_lapse(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It never depended on the heartbeat, so a lapse does not disturb it."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._power_saving = True
+    coordinator._control_stale = True
+
+    reconcile(coordinator, {})
+
+    write.assert_not_awaited()
+    assert coordinator._control_stale is False
+
+
+def test_a_lapse_re_sends_the_setpoint_before_the_control_word(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The device fell back to app settings, so the setpoint is gone too."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._control_intent = models.ControlIntent.CHARGE_BATTERY
+    coordinator._control_power = 800.0
+    coordinator._control_stale = True
+
+    reconcile(coordinator, {})
+
+    addresses = [call.kwargs["address"] for call in write.await_args_list]
+    assert addresses == [
+        const.REGISTERS_BY_KEY["battery_power_setpoint"].address,
+        const.CONTROL_COMMAND_REGISTER,
+    ]
+
+
+def test_a_settled_command_is_not_re_sent_by_polling(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0x0213 reads 0 on a PowerOcean Plus; polling must never second-guess us."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._control_intent = models.ControlIntent.CHARGE_BATTERY
+    coordinator._control_stale = False
+
+    reconcile(coordinator, {"system_state_2": 0})
+
+    assert coordinator.reported_control_method({"system_state_2": 0}) is None
+    write.assert_not_awaited()
+
+
+def test_re_send_failure_does_not_break_the_poll(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator._client.write_registers = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+    coordinator._power_saving = True
+    coordinator._control_stale = True
+
+    reconcile(coordinator, {"system_state_2": 0})
+
+    assert coordinator.control_command == 0b1000
 
 
 @pytest.mark.parametrize(
@@ -583,6 +1102,7 @@ def test_gets_and_decodes_raw_data(
     decode_register = Mock(side_effect=(2.0, 42.0))
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_send_heartbeat = AsyncMock(return_value=True)
     coordinator.async_read_block = AsyncMock(return_value=[2, 42])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
 
@@ -606,6 +1126,7 @@ def test_captures_disabled_state_when_battery_count_guard_drops_frame(
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     monkeypatch.setattr(coordinator_module.asyncio, "sleep", AsyncMock())
     coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_send_heartbeat = AsyncMock(return_value=True)
     coordinator.async_read_block = AsyncMock(return_value=[0, 0])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
     coordinator.serial_number = "R123456789"
@@ -632,6 +1153,7 @@ def test_modbus_disabled_recovers_when_telemetry_returns(
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     monkeypatch.setattr(coordinator_module.asyncio, "sleep", AsyncMock())
     coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_send_heartbeat = AsyncMock(return_value=True)
     coordinator.async_read_block = AsyncMock(return_value=[0, 0])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
     coordinator.serial_number = "R123456789"

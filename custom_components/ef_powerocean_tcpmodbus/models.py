@@ -94,11 +94,84 @@ class GridMode(StrEnum):
     ISLANDED = "islanded"
 
 
+class ControlMode(StrEnum):
+    """Control method the device follows.
+
+    Commanded through bits 4-7 of the System Control Command (0x0215) and reported
+    back through bits 7-10 of System State 2 (0x0213). Both use the same numbering.
+    """
+
+    DEFAULT = "default"
+    SYSTEM_FEED = "system_feed"
+    INVERTER_FEED = "inverter_feed"
+    BATTERY_LIMITS = "battery_limits"
+    UNKNOWN = "unknown"
+
+    @property
+    def command_value(self) -> int | None:
+        """Return the protocol enumeration value, or None if not commandable."""
+        return {
+            ControlMode.DEFAULT: 0,
+            ControlMode.SYSTEM_FEED: 1,
+            ControlMode.INVERTER_FEED: 2,
+            ControlMode.BATTERY_LIMITS: 3,
+        }.get(self)
+
+    @classmethod
+    def from_command_value(cls, value: int) -> ControlMode:
+        """Map a protocol enumeration value to a mode, UNKNOWN if unrecognised."""
+        for mode in cls:
+            if mode.command_value == value:
+                return mode
+        return cls.UNKNOWN
+
+    @classmethod
+    def selectable(cls) -> tuple[ControlMode, ...]:
+        """Return the modes a user may command."""
+        return tuple(mode for mode in cls if mode.command_value is not None)
+
+
+class ControlIntent(StrEnum):
+    """What the user wants the inverter to do, in their terms rather than the protocol's.
+
+    Each intent pins a control method and the sign of its setpoint, so the power
+    entity is always a positive magnitude and no combination of the two can be wrong.
+    """
+
+    AUTOMATIC = "automatic"
+    CHARGE_BATTERY = "charge_battery"
+    DISCHARGE_BATTERY = "discharge_battery"
+    IMPORT_FROM_GRID = "import_from_grid"
+    EXPORT_TO_GRID = "export_to_grid"
+    LIMIT_INVERTER_OUTPUT = "limit_inverter_output"
+
+
+@dataclass(frozen=True)
+class ControlIntentDef:
+    """How an intent maps onto the protocol, and how to bound and seed its power."""
+
+    method: ControlMode
+    # Read key of the setpoint register the method acts on; None for AUTOMATIC.
+    setpoint_key: str | None = None
+    # Applied to the user's positive magnitude to get the value the device wants.
+    sign: int = 1
+    # Telemetry key whose present value seeds the power when the intent is engaged,
+    # so switching mode never applies a stale setpoint from a previous session.
+    seed_key: str | None = None
+    # Telemetry key holding the device's own ceiling for this intent, if it has one.
+    limit_key: str | None = None
+
+    @property
+    def controls_power(self) -> bool:
+        return self.setpoint_key is not None
+
+
 class RegisterType(StrEnum):
     """Word layout of a register. Multi-word values are stored low word first."""
 
     UINT16 = "uint16"
     UINT32 = "uint32"
+    INT32 = "int32"
     FLOAT32 = "float32"
     SERIAL = "serial"
 
@@ -106,10 +179,42 @@ class RegisterType(StrEnum):
 REGISTER_SIZES: Final = {
     RegisterType.UINT16: 1,
     RegisterType.UINT32: 2,
+    RegisterType.INT32: 2,
     RegisterType.FLOAT32: 2,
     # 16 ASCII bytes.
     RegisterType.SERIAL: 8,
 }
+
+
+def encode_register(value: int, data_type: RegisterType) -> list[int]:
+    """Return the raw words for writing *value*, HIGH word first.
+
+    Reads and writes disagree on this device. It publishes 32-bit values low word
+    first (see decode_register) but parses multi-register writes high word first:
+    a setpoint of 500 sent low word first is taken as 500 << 16 and the command is
+    ignored, while the same value sent high word first is applied and then
+    re-published low word first. At least on the PowerOcean Plus, this behavior
+    has been observed consistently.
+
+    Raises ValueError when the value does not fit the type or cannot be written.
+    """
+    if data_type is RegisterType.UINT16:
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"{value} does not fit a UINT16 register")
+        return [value]
+
+    if data_type is RegisterType.UINT32:
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"{value} does not fit a UINT32 register")
+        word = value
+    elif data_type is RegisterType.INT32:
+        if not -0x80000000 <= value <= 0x7FFFFFFF:
+            raise ValueError(f"{value} does not fit an INT32 register")
+        word = value & 0xFFFFFFFF
+    else:
+        raise ValueError(f"Registers of type {data_type} cannot be written")
+
+    return [(word >> 16) & 0xFFFF, word & 0xFFFF]
 
 
 @dataclass(frozen=True)
@@ -220,6 +325,37 @@ class BinarySensorDef:
 
 
 @dataclass(frozen=True)
+class SwitchDef:
+    key: str
+    name: str | None = None
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
+class SelectDef:
+    key: str
+    options: tuple[str, ...]
+    name: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
+class ControlPowerDef:
+    """The single power entity whose meaning follows the selected control intent."""
+
+    key: str
+    step: float
+    unit: str
+    name: str | None = None
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class NumberWritableDef:
     key: str  # Unique key for the number entity (e.g., "min_soc_limit_control")
     read_key: str  # The original key from MODBUS_REGISTERS used for reading (e.g., "min_soc_limit")
@@ -228,6 +364,14 @@ class NumberWritableDef:
     min_value: float  # Slider minimum value
     max_value: float  # Slider maximum value
     step: float  # Step size (1.0 for integers, 0.1 for floats)
+    data_type: RegisterType = RegisterType.UINT16  # Word layout used for the write
     unit: str | None = None  # Unit of measurement
     device_class: str | None = None  # Device class type
     icon: str | None = None  # Custom icon for the slider
+    # Not implemented on every model: hidden from the entity list unless enabled.
+    advanced: bool = False
+
+    @property
+    def size(self) -> int:
+        """Return how many 16-bit words the write occupies."""
+        return REGISTER_SIZES[self.data_type]

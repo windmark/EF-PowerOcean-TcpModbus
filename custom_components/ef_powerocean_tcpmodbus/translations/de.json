@@ -90,6 +90,7 @@
         "powerocean_single_phase": "PowerOcean 1-phasig",
         "powerocean_three_phase": "PowerOcean 3-phasig",
         "powerocean_plus": "PowerOcean Plus",
+        "powerocean_dc_fit": "PowerOcean DC Fit",
         "ocean_2": "Ocean 2"
       }
     }
@@ -98,6 +99,18 @@
     "sensor": {
       "system_modes": {
         "name": "Betriebsmodi"
+      },
+      "system_state_2": {
+        "name": "Betriebsmodi 2"
+      },
+      "system_power_setpoint": {
+        "name": "System-Leistungssollwert"
+      },
+      "inverter_power_setpoint": {
+        "name": "Wechselrichter-Leistungssollwert"
+      },
+      "battery_power_setpoint": {
+        "name": "Batterie-Leistungssollwert"
       },
       "battery_count": {
         "name": "Batterieanzahl"
@@ -327,9 +340,15 @@
           "grid": "Netzbetrieb",
           "islanded": "Inselbetrieb"
         }
+      },
+      "inverter_output_power": {
+        "name": "Wechselrichter-Ausgangsleistung"
       }
     },
     "binary_sensor": {
+      "modbus_control": {
+        "name": "Modbus-Steuerung"
+      },
       "self_use_mode_ena": {
         "name": "Eigenstromversorgung"
       },
@@ -347,11 +366,35 @@
       }
     },
     "number": {
+      "control_power_control": {
+        "name": "Steuerungsleistung"
+      },
       "min_soc_limit_control": {
         "name": "Batterie Backup-Reserve Steuerung"
       },
       "device_led_brightness_control": {
         "name": "Helligkeit LED-Geräteanzeige Steuerung"
+      }
+    },
+    "select": {
+      "control_mode_control": {
+        "name": "Steuerungsmodus",
+        "state": {
+          "automatic": "Automatisch",
+          "charge_battery": "Batterie laden mit",
+          "discharge_battery": "Batterie entladen mit",
+          "import_from_grid": "Netzbezug von",
+          "export_to_grid": "Netzeinspeisung von",
+          "limit_inverter_output": "Wechselrichterleistung begrenzen auf"
+        }
+      }
+    },
+    "switch": {
+      "heartbeat_ena": {
+        "name": "Modbus-Heartbeat"
+      },
+      "battery_saver_mode_control": {
+        "name": "Batteriesparmodus Steuerung"
       }
     }
   }

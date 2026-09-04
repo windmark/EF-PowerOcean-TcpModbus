@@ -21,12 +21,17 @@ from ef_powerocean_tcpmodbus.telemetry import (
         ([0x0000, 0x0001], RegisterType.UINT32, 65536.0),
         # A value that fits the low word alone must decode the same as before.
         ([15000, 0x0000], RegisterType.UINT32, 15000.0),
+        ([3000, 0x0000], RegisterType.INT32, 3000.0),
+        # Feed-in setpoints are negative, so the sign bit must survive the swap.
+        ([0xF448, 0xFFFF], RegisterType.INT32, -3000.0),
     ),
     ids=(
         "single-register",
         "word-swapped-float",
         "uint32-uses-the-high-word",
         "uint32-low-word-only",
+        "int32-positive",
+        "int32-negative",
     ),
 )
 def test_decodes_register_values(
@@ -89,6 +94,7 @@ class CalculateValuesTest(unittest.TestCase):
             "pv3_current": 3.0,
             "pv3_voltage": 250.0,
             "system_modes": 0b101000,
+            "system_state_2": (2 << 7) | 0b101000,
         }
 
     def calculate(
@@ -126,10 +132,20 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertFalse(result["self_use_mode_ena"])
         self.assertTrue(result["intelligent_mode_ena"])
 
+    def test_derives_inverter_output_from_house_and_grid_power(self) -> None:
+        """The AC output has no register: it is what the house takes plus any export."""
+        self.data["house_power"] = 1500.0
+        self.data["grid_power"] = -2000.0
+        self.assertEqual(self.calculate()["inverter_output_power"], 3500.0)
+
+        self.data["grid_power"] = 500.0
+        self.assertEqual(self.calculate()["inverter_output_power"], 1000.0)
+
     def test_omits_optional_values_when_their_inputs_are_disabled_or_absent(
         self,
     ) -> None:
         del self.data["system_modes"]
+        del self.data["system_state_2"]
 
         result = self.calculate(calculate_solar_power=False)
 
@@ -138,6 +154,7 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertNotIn("battery_saver_mode_ena", result)
         self.assertNotIn("self_use_mode_ena", result)
         self.assertNotIn("intelligent_mode_ena", result)
+        self.assertNotIn("inverter_output_power", result)
 
     def test_returns_none_when_required_inputs_are_missing(self) -> None:
         del self.data["battery_soc"]
