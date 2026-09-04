@@ -17,7 +17,10 @@ from homeassistant.const import (
 
 from .models import (
     BinarySensorDef,
+    ControlIntent,
+    ControlIntentDef,
     ControlMode,
+    ControlPowerDef,
     CoordinatorStatus,
     EnergySensorDef,
     GridMode,
@@ -86,13 +89,10 @@ CONTROL_COMMAND_METHOD_MASK: Final = 0xF
 SYSTEM_STATUS_LOW_POWER_BIT: Final = 3
 
 # System State 2 (0x0213) reports the control method the device is actually
-# following in bits 7-10. It is the only read-back the write-only command has.
+# following in bits 7-10. It reads 0 on a PowerOcean Plus, where the register is not
+# implemented, so it is never treated as a read-back of the command.
 SYSTEM_STATE_2_CONTROL_MODE_SHIFT: Final = 7
 SYSTEM_STATE_2_CONTROL_MODE_MASK: Final = 0xF
-
-# A commanded control method the device stops reporting is sent again, but no more
-# often than this, so a slow device is not hammered and a toggle bit is not flipped.
-CONTROL_COMMAND_REASSERT_INTERVAL_S: Final = 30
 
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
@@ -467,11 +467,12 @@ SENSOR_MAP: list[SensorDef] = [
         icon="mdi:home-lightning-bolt",
     ),
     SensorDef(
-        key="control_mode",
-        device_class="enum",
-        options=tuple(ControlMode),
+        key="inverter_output_power",
+        unit=UnitOfPower.WATT,
+        device_class="power",
+        state_class="measurement",
         entity_category=EntityCategory.DIAGNOSTIC,
-        icon="mdi:remote",
+        icon="mdi:sine-wave",
     ),
     *[
         SensorDef(
@@ -593,7 +594,15 @@ BINARY_SENSOR_MAP: list[BinarySensorDef] = [
 ]
 
 
+# Not a device register: whether the heartbeat currently holds control authority.
+MODBUS_CONTROL_BINARY_SENSOR: Final = BinarySensorDef(
+    key="modbus_control",
+    device_class="running",
+    entity_category=EntityCategory.DIAGNOSTIC,
+)
+
 # Local toggle, not a device register: it gates whether the heartbeat is sent at all.
+# The control intent arms and releases it, so this is only for debugging.
 HEARTBEAT_SWITCH: Final = SwitchDef(
     key="heartbeat_ena",
     entity_category=EntityCategory.CONFIG,
@@ -607,13 +616,67 @@ POWER_SAVING_SWITCH: Final = SwitchDef(
     icon="mdi:leaf",
 )
 
-# Written as bits 4-7 of the control command register; read back as control_mode.
-CONTROL_METHOD_SELECT: Final = SelectDef(
-    key="control_method_control",
-    options=tuple(ControlMode.selectable()),
+# What each intent means on the wire. The sign lives here rather than in the user's
+# value, so the power entity is always a positive magnitude.
+CONTROL_INTENTS: Final[dict[ControlIntent, ControlIntentDef]] = {
+    ControlIntent.AUTOMATIC: ControlIntentDef(method=ControlMode.DEFAULT),
+    ControlIntent.CHARGE_BATTERY: ControlIntentDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=1,
+        seed_key="battery_power",
+        limit_key="battery_charge_power_limit",
+    ),
+    ControlIntent.DISCHARGE_BATTERY: ControlIntentDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=-1,
+        seed_key="battery_power",
+        limit_key="battery_discharge_power_limit",
+    ),
+    ControlIntent.IMPORT_FROM_GRID: ControlIntentDef(
+        method=ControlMode.SYSTEM_FEED,
+        setpoint_key="system_power_setpoint",
+        sign=1,
+        seed_key="grid_power",
+    ),
+    ControlIntent.EXPORT_TO_GRID: ControlIntentDef(
+        method=ControlMode.SYSTEM_FEED,
+        setpoint_key="system_power_setpoint",
+        sign=-1,
+        seed_key="grid_power",
+        limit_key="feed_in_power_max",
+    ),
+    ControlIntent.LIMIT_INVERTER_OUTPUT: ControlIntentDef(
+        method=ControlMode.INVERTER_FEED,
+        setpoint_key="inverter_power_setpoint",
+        sign=1,
+        # The inverter's AC output is not a register: house power less grid power.
+        seed_key="inverter_output_power",
+        limit_key="inverter_rated_power",
+    ),
+}
+
+CONTROL_INTENT_SELECT: Final = SelectDef(
+    key="control_mode_control",
+    options=tuple(ControlIntent),
     entity_category=EntityCategory.CONFIG,
     icon="mdi:remote",
 )
+
+# One number for every intent. Its meaning and ceiling follow the selected intent,
+# and it is unavailable while the inverter is running itself.
+CONTROL_POWER_NUMBER: Final = ControlPowerDef(
+    key="control_power_control",
+    step=10.0,
+    unit=UnitOfPower.WATT,
+    device_class="power",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:speedometer",
+)
+
+# Fallback ceiling for an intent whose limit register is missing or reads zero.
+CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
 
 
 # Map of all modbus registers available for writing operations.
@@ -628,6 +691,8 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         step=1.0,
         unit=UnitOfRatio.PERCENTAGE,
         device_class="battery",
+        # Accepted and ignored on a PowerOcean Plus; it works on the 1ph/3ph models.
+        advanced=True,
     ),
     NumberWritableDef(
         key="device_led_brightness_control",
@@ -641,7 +706,7 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         icon="mdi:led-on",
     ),
     # Setpoints. Positive draws from the grid / charges, negative feeds / discharges.
-    # Each is inert until the matching control method is selected.
+    # The control intent drives these; they stay here for direct register access.
     NumberWritableDef(
         key="system_power_setpoint_control",
         read_key="system_power_setpoint",
@@ -655,6 +720,7 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         device_class="power",
         icon="mdi:transmission-tower",
         requires_control_method=ControlMode.SYSTEM_FEED,
+        advanced=True,
     ),
     NumberWritableDef(
         key="inverter_power_setpoint_control",
@@ -669,6 +735,7 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         device_class="power",
         icon="mdi:sine-wave",
         requires_control_method=ControlMode.INVERTER_FEED,
+        advanced=True,
     ),
     NumberWritableDef(
         key="battery_power_setpoint_control",
@@ -683,5 +750,6 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         device_class="power",
         icon="mdi:battery-charging",
         requires_control_method=ControlMode.BATTERY_LIMITS,
+        advanced=True,
     ),
 ]

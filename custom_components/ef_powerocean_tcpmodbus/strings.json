@@ -341,18 +341,14 @@
           "islanded": "Islanded"
         }
       },
-      "control_mode": {
-        "name": "Control Mode",
-        "state": {
-          "default": "Default",
-          "system_feed": "System feed-in/draw",
-          "inverter_feed": "Inverter feed-in/draw",
-          "battery_limits": "Battery charge/discharge limits",
-          "unknown": "Unknown"
-        }
+      "inverter_output_power": {
+        "name": "Inverter Output Power"
       }
     },
     "binary_sensor": {
+      "modbus_control": {
+        "name": "Modbus Control"
+      },
       "self_use_mode_ena": {
         "name": "Self-powered Mode"
       },
@@ -370,11 +366,36 @@
       }
     },
     "number": {
+      "control_power_control": {
+        "name": "Control Power"
+      },
       "min_soc_limit_control": {
         "name": "Minimum SOC Limit Control"
       },
       "device_led_brightness_control": {
         "name": "LED Brightness Control"
+      },
+      "system_power_setpoint_control": {
+        "name": "System Power Setpoint Control"
+      },
+      "inverter_power_setpoint_control": {
+        "name": "Inverter Power Setpoint Control"
+      },
+      "battery_power_setpoint_control": {
+        "name": "Battery Power Setpoint Control"
+      }
+    },
+    "select": {
+      "control_mode_control": {
+        "name": "Control Mode",
+        "state": {
+          "automatic": "Automatic",
+          "charge_battery": "Charge battery at",
+          "discharge_battery": "Discharge battery at",
+          "import_from_grid": "Import from grid at",
+          "export_to_grid": "Export to grid at",
+          "limit_inverter_output": "Limit inverter output to"
+        }
       }
     },
     "switch": {

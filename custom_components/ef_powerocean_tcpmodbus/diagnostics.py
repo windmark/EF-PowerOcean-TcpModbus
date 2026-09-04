@@ -36,7 +36,12 @@ async def async_get_config_entry_diagnostics(
             "pymodbus": coordinator.get_pymodbus_version(),
             "heartbeat_supported": coordinator.heartbeat_supported,
             "last_heartbeat_time": coordinator.last_heartbeat_time,
-            "control_mode": (coordinator.data or {}).get("control_mode"),
+            "in_control": coordinator.in_control,
+            "control_intent": str(coordinator.control_intent),
+            "control_method": str(coordinator.control_method),
+            "control_power": coordinator.control_power,
+            "control_command": f"0x{coordinator.control_command:08X}",
+            "system_state_2": (coordinator.data or {}).get("system_state_2"),
         },
         TO_REDACT,
     )

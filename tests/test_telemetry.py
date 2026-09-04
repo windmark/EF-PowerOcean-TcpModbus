@@ -132,14 +132,14 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertFalse(result["self_use_mode_ena"])
         self.assertTrue(result["intelligent_mode_ena"])
 
-    def test_decodes_control_mode_bits(self) -> None:
-        self.assertEqual(self.calculate()["control_mode"], "inverter_feed")
+    def test_derives_inverter_output_from_house_and_grid_power(self) -> None:
+        """The AC output has no register: it is what the house takes plus any export."""
+        self.data["house_power"] = 1500.0
+        self.data["grid_power"] = -2000.0
+        self.assertEqual(self.calculate()["inverter_output_power"], 3500.0)
 
-        self.data["system_state_2"] = 0
-        self.assertEqual(self.calculate()["control_mode"], "default")
-
-        self.data["system_state_2"] = 0b1111 << 7
-        self.assertEqual(self.calculate()["control_mode"], "unknown")
+        self.data["grid_power"] = 500.0
+        self.assertEqual(self.calculate()["inverter_output_power"], 1000.0)
 
     def test_omits_optional_values_when_their_inputs_are_disabled_or_absent(
         self,
@@ -154,7 +154,7 @@ class CalculateValuesTest(unittest.TestCase):
         self.assertNotIn("battery_saver_mode_ena", result)
         self.assertNotIn("self_use_mode_ena", result)
         self.assertNotIn("intelligent_mode_ena", result)
-        self.assertNotIn("control_mode", result)
+        self.assertNotIn("inverter_output_power", result)
 
     def test_returns_none_when_required_inputs_are_missing(self) -> None:
         del self.data["battery_soc"]

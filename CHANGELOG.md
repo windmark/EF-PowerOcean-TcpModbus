@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Writes are now acted on.** The inverter parses multi-register writes high word
+  first while publishing reads low word first, so every 32-bit write was received
+  multiplied by 65536: the control word arrived with an empty method nibble and the
+  inverter ignored it. Only 16-bit writes (LED brightness, heartbeat) ever worked.
+
+### Added
+
+- **Control Mode** select and a single **Control Power** number replace the control
+  method select and the three setpoint numbers. Each mode pins a control method and
+  the sign of its setpoint, so the power is always a positive magnitude and an
+  invalid combination cannot be expressed.
+- Engaging a mode seeds its setpoint from what the system is doing right now, so
+  switching mode never applies a stale value from a previous session.
+- **Modbus Control** binary sensor showing whether the inverter is actually
+  following this integration.
+- **Inverter Output Power** sensor, derived from house power less grid power.
+
+### Changed
+
+- The heartbeat is armed and released by the control mode. The Modbus Heartbeat
+  switch is now disabled by default and kept only for debugging.
+- The power ceiling for each mode comes from the device's own limit registers.
+- The three raw setpoint numbers and the minimum SOC limit are disabled by default.
+
+### Removed
+
+- **Control Mode** sensor. It read System State 2 (0x0213), which is not
+  implemented on the PowerOcean Plus and always reported "default".
+
 ## [2.4.0] - 2026-08-18
 
 ### Added

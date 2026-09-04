@@ -7,7 +7,7 @@ import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .models import REGISTER_SIZES, ControlMode, GridMode, OperatingMode, RegisterType
+from .models import REGISTER_SIZES, GridMode, OperatingMode, RegisterType
 
 
 def decode_serial_number(registers: list[int] | None) -> str | None:
@@ -70,6 +70,8 @@ class TelemetryData:
     system_modes: float | None = None
     system_state_2: float | None = None
     battery_capacity: float | None = None
+    house_power: float | None = None
+    grid_power: float | None = None
     fault_codes: tuple[float | None, ...] = ()
 
     @classmethod
@@ -101,6 +103,8 @@ class TelemetryData:
             system_modes=data.get("system_modes"),
             system_state_2=data.get("system_state_2"),
             battery_capacity=data.get("battery_capacity"),
+            house_power=data.get("house_power"),
+            grid_power=data.get("grid_power"),
             fault_codes=tuple(value for _, value in sorted(faults)),
         )
 
@@ -174,13 +178,6 @@ _OPERATING_MODES = {
     0: OperatingMode.STANDBY,
     1: OperatingMode.SELF_CONSUMPTION,
     2: OperatingMode.AI,
-}
-
-_CONTROL_MODES = {
-    0: ControlMode.DEFAULT,
-    1: ControlMode.SYSTEM_FEED,
-    2: ControlMode.INVERTER_FEED,
-    3: ControlMode.BATTERY_LIMITS,
 }
 
 
@@ -266,9 +263,11 @@ def calculate_derived_values(
             (system_modes >> 4) & 0b111, OperatingMode.UNKNOWN
         )
 
-    if data.system_state_2 is not None:
-        calculated["control_mode"] = _CONTROL_MODES.get(
-            (int(data.system_state_2) >> 7) & 0b1111, ControlMode.UNKNOWN
+    # The inverter's AC output has no register: everything it feeds the house with
+    # plus whatever goes to the grid. Used to seed the inverter output limit.
+    if data.house_power is not None and data.grid_power is not None:
+        calculated["inverter_output_power"] = round(
+            data.house_power - data.grid_power, 1
         )
 
     calculated["active_faults"] = _format_active_faults(data.fault_codes)

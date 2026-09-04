@@ -131,6 +131,41 @@ class ControlMode(StrEnum):
         return tuple(mode for mode in cls if mode.command_value is not None)
 
 
+class ControlIntent(StrEnum):
+    """What the user wants the inverter to do, in their terms rather than the protocol's.
+
+    Each intent pins a control method and the sign of its setpoint, so the power
+    entity is always a positive magnitude and no combination of the two can be wrong.
+    """
+
+    AUTOMATIC = "automatic"
+    CHARGE_BATTERY = "charge_battery"
+    DISCHARGE_BATTERY = "discharge_battery"
+    IMPORT_FROM_GRID = "import_from_grid"
+    EXPORT_TO_GRID = "export_to_grid"
+    LIMIT_INVERTER_OUTPUT = "limit_inverter_output"
+
+
+@dataclass(frozen=True)
+class ControlIntentDef:
+    """How an intent maps onto the protocol, and how to bound and seed its power."""
+
+    method: ControlMode
+    # Read key of the setpoint register the method acts on; None for AUTOMATIC.
+    setpoint_key: str | None = None
+    # Applied to the user's positive magnitude to get the value the device wants.
+    sign: int = 1
+    # Telemetry key whose present value seeds the power when the intent is engaged,
+    # so switching mode never applies a stale setpoint from a previous session.
+    seed_key: str | None = None
+    # Telemetry key holding the device's own ceiling for this intent, if it has one.
+    limit_key: str | None = None
+
+    @property
+    def controls_power(self) -> bool:
+        return self.setpoint_key is not None
+
+
 class RegisterType(StrEnum):
     """Word layout of a register. Multi-word values are stored low word first."""
 
@@ -152,11 +187,16 @@ REGISTER_SIZES: Final = {
 
 
 def encode_register(value: int, data_type: RegisterType) -> list[int]:
-    """Return the raw words for writing *value*, low word first.
+    """Return the raw words for writing *value*, HIGH word first.
 
-    Mirrors the word order the read path decodes, and the protocol note that a
-    UINT32 0x12345678 travels as 0x5678 0x1234. Raises ValueError when the value
-    does not fit the type or the type cannot be written.
+    Reads and writes disagree on this device. It publishes 32-bit values low word
+    first (see decode_register) but parses multi-register writes high word first:
+    a setpoint of 500 sent low word first is taken as 500 << 16 and the command is
+    ignored, while the same value sent high word first is applied and then
+    re-published low word first. At least on the PowerOcean Plus, this behavior
+    has been observed consistently.
+
+    Raises ValueError when the value does not fit the type or cannot be written.
     """
     if data_type is RegisterType.UINT16:
         if not 0 <= value <= 0xFFFF:
@@ -174,7 +214,7 @@ def encode_register(value: int, data_type: RegisterType) -> list[int]:
     else:
         raise ValueError(f"Registers of type {data_type} cannot be written")
 
-    return [word & 0xFFFF, (word >> 16) & 0xFFFF]
+    return [(word >> 16) & 0xFFFF, word & 0xFFFF]
 
 
 @dataclass(frozen=True)
@@ -303,6 +343,19 @@ class SelectDef:
 
 
 @dataclass(frozen=True)
+class ControlPowerDef:
+    """The single power entity whose meaning follows the selected control intent."""
+
+    key: str
+    step: float
+    unit: str
+    name: str | None = None
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class NumberWritableDef:
     key: str  # Unique key for the number entity (e.g., "min_soc_limit_control")
     read_key: str  # The original key from MODBUS_REGISTERS used for reading (e.g., "min_soc_limit")
@@ -317,6 +370,9 @@ class NumberWritableDef:
     icon: str | None = None  # Custom icon for the slider
     # Control method the device must be following for this value to have any effect.
     requires_control_method: ControlMode | None = None
+    # Raw register access that the control intent already covers: kept for experts,
+    # hidden from the entity list unless someone enables it.
+    advanced: bool = False
 
     @property
     def size(self) -> int:

@@ -11,10 +11,10 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, WRITABLE_NUMBERS_MAP
+from .const import CONTROL_POWER_NUMBER, DOMAIN, WRITABLE_NUMBERS_MAP
 from .coordinator import EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
-from .models import NumberWritableDef
+from .models import ControlIntent, ControlPowerDef, NumberWritableDef
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,12 +30,69 @@ async def async_setup_entry(
     """Automatically set up number entities from the WRITABLE_NUMBERS_MAP configuration list."""
     coordinator: EcoflowCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities = [
+    entities: list[NumberEntity] = [
+        EcoFlowControlPowerNumber(coordinator, entry, CONTROL_POWER_NUMBER)
+    ]
+    entities.extend(
         EcoFlowGenericNumber(coordinator, entry, number_def)
         for number_def in WRITABLE_NUMBERS_MAP
-    ]
+    )
 
     async_add_entities(entities)
+
+
+class EcoFlowControlPowerNumber(EcoFlowBaseEntity, NumberEntity):
+    """The single power target for whichever control mode is selected.
+
+    There is one of these rather than one per setpoint register, so a value can
+    never be written to a register the active control method is ignoring. The
+    ceiling follows the mode and comes from the device's own limits.
+    """
+
+    _attr_native_min_value = 0.0
+    _attr_mode = NumberMode.BOX
+
+    def __init__(
+        self,
+        coordinator: EcoflowCoordinator,
+        entry: ConfigEntry,
+        definition: ControlPowerDef,
+    ) -> None:
+        super().__init__(coordinator, entry, definition)
+        self._attr_native_step = definition.step
+        self._attr_native_unit_of_measurement = definition.unit
+        self._attr_device_class = definition.device_class
+        self._attr_entity_category = definition.entity_category
+        if definition.icon:
+            self._attr_icon = definition.icon
+
+    @property
+    def available(self) -> bool:
+        # Nothing to target while the inverter is running itself.
+        return (
+            super().available
+            and self.coordinator.control_intent is not ControlIntent.AUTOMATIC
+        )
+
+    @property
+    def native_max_value(self) -> float:
+        return self.coordinator.control_power_max
+
+    @property
+    def native_value(self) -> float:
+        # The ceiling is read live, so it can drop below what was commanded.
+        return min(self.coordinator.control_power, self.coordinator.control_power_max)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "control_mode": str(self.coordinator.control_intent),
+            # The device slews at roughly 1.5 kW/min, so measured power lags this.
+            "in_control": self.coordinator.in_control,
+        }
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_set_control_power(value)
 
 
 class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
@@ -52,6 +109,9 @@ class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):
 
         # Track the last written value to prevent redundant state updates
         self._last_written_value: float | None = None
+
+        # Raw register access the control mode already covers.
+        self._attr_entity_registry_enabled_default = not definition.advanced
 
         # Configure native Home Assistant number attributes
         self._attr_native_min_value = definition.min_value

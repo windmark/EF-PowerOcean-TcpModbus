@@ -32,9 +32,10 @@ from .const import (
     CONTROL_COMMAND_METHOD_MASK,
     CONTROL_COMMAND_METHOD_SHIFT,
     CONTROL_COMMAND_POWER_SAVING_BIT,
-    CONTROL_COMMAND_REASSERT_INTERVAL_S,
     CONTROL_COMMAND_REGISTER,
     CONTROL_COMMAND_UNSAFE_BITS,
+    CONTROL_INTENTS,
+    CONTROL_POWER_FALLBACK_MAX,
     DEFAULT_BATTERY_COUNT,
     DEFAULT_INVERTER_MODEL,
     DEFAULT_MAX_GRID_POWER,
@@ -54,6 +55,7 @@ from .const import (
     PRODUCT_CATEGORY,
     PRODUCT_NUMBER,
     REGISTER_BLOCKS,
+    REGISTERS_BY_KEY,
     SERIAL_NUMBER,
     SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S,
     SLEEP_TIME_AFTER_RECONNECT_S,
@@ -61,14 +63,15 @@ from .const import (
     STORAGE_VERSION,
     SYSTEM_STATE_2_CONTROL_MODE_MASK,
     SYSTEM_STATE_2_CONTROL_MODE_SHIFT,
-    SYSTEM_STATUS_LOW_POWER_BIT,
 )
 from .energy_processor import EnergyProcessor
 from .models import (
+    ControlIntent,
     ControlMode,
     CoordinatorStatus,
     InverterModel,
     NumberWritableDef,
+    RegisterType,
     encode_register,
 )
 from .telemetry import (
@@ -139,18 +142,18 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
         self._last_heartbeat_time: datetime | None = None
-        self._heartbeat_enabled = True
+        # Armed by the control intent, not by the user: holding it on would take
+        # control away from the EcoFlow app for no reason.
+        self._heartbeat_enabled = False
         # None until the device has answered once, so an unsupported model is logged once.
         self._heartbeat_supported: bool | None = None
 
-        # The write-only control word is composed from these two pieces of state, so
-        # changing one never clobbers the other. Nothing is written until the user
-        # commands something; the first read adopts whatever method the device is in.
-        self._control_method = ControlMode.DEFAULT
-        self._control_method_adopted = False
+        # A restart stops the heartbeat, so the device has already handed control back
+        # to the app by the time we get here: automatic is the truth, not a guess.
+        self._control_intent = ControlIntent.AUTOMATIC
+        self._control_power = 0.0
         self._power_saving = False
         self._last_control_write_time: datetime | None = None
-        self._control_mismatch_logged = False
         # Set when control authority may have lapsed; the next poll re-sends the word.
         self._control_stale = False
 
@@ -192,9 +195,47 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return self._last_heartbeat_time
 
     @property
+    def control_intent(self) -> ControlIntent:
+        """Return the intent the user has commanded."""
+        return self._control_intent
+
+    @property
     def control_method(self) -> ControlMode:
-        """Return the control method being commanded."""
-        return self._control_method
+        """Return the protocol control method the current intent maps to."""
+        return CONTROL_INTENTS[self._control_intent].method
+
+    @property
+    def control_power(self) -> float:
+        """Return the commanded power magnitude for the current intent."""
+        return self._control_power
+
+    @property
+    def control_power_max(self) -> float:
+        """Return the ceiling for the current intent, from the device where it knows one."""
+        return self._control_power_ceiling(self._control_intent)
+
+    def _control_power_ceiling(self, intent: ControlIntent) -> float:
+        definition = CONTROL_INTENTS[intent]
+        if definition.limit_key is not None:
+            limit = (self.data or {}).get(definition.limit_key)
+            if limit:
+                return float(limit)
+        if intent is ControlIntent.IMPORT_FROM_GRID:
+            return float(
+                self.limits.get(CONF_MAX_GRID_POWER, CONTROL_POWER_FALLBACK_MAX)
+            )
+        return float(CONTROL_POWER_FALLBACK_MAX)
+
+    @property
+    def in_control(self) -> bool:
+        """Return whether the device is currently accepting our commands."""
+        if not self._heartbeat_enabled or self._heartbeat_supported is not True:
+            return False
+        if self._last_heartbeat_time is None:
+            return False
+        return (
+            dt.now() - self._last_heartbeat_time
+        ).total_seconds() <= HEARTBEAT_LAPSE_S
 
     @property
     def power_saving_commanded(self) -> bool:
@@ -213,27 +254,21 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     def reported_control_method(
         self, data: dict[str, Any] | None = None
     ) -> ControlMode | None:
-        """Return the control method the device reports in System State 2, if read."""
+        """Return the control method the device reports in System State 2, if usable.
+
+        Bits 0-6 of System State 2 mirror System Modes, so an all-zero word on a
+        system that is reporting anything at all means the register is not
+        implemented. The PowerOcean Plus is such a unit: it would otherwise report
+        "default" forever and provoke an endless re-send of the control word.
+        """
         source = data if data is not None else self.data
         state = (source or {}).get("system_state_2")
-        if state is None:
+        if state is None or int(state) == 0:
             return None
         return ControlMode.from_command_value(
             (int(state) >> SYSTEM_STATE_2_CONTROL_MODE_SHIFT)
             & SYSTEM_STATE_2_CONTROL_MODE_MASK
         )
-
-    def reported_low_power(self, data: dict[str, Any] | None = None) -> bool | None:
-        """Return whether the device reports low-power mode as engaged, if read.
-
-        This is a status bit: it only goes high once the inverter has actually gone
-        idle, so it cannot confirm or deny the commanded power-saving switch.
-        """
-        source = data if data is not None else self.data
-        state = (source or {}).get("system_modes")
-        if state is None:
-            return None
-        return bool((int(state) >> SYSTEM_STATUS_LOW_POWER_BIT) & 1)
 
     def get_pymodbus_version(self) -> str:
         return pyModbusVersion
@@ -427,34 +462,43 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return True
 
     async def async_set_heartbeat_enabled(self, enabled: bool) -> None:
-        """Turn the heartbeat on or off at runtime, without reloading the entry."""
+        """Turn the heartbeat on or off at runtime, without reloading the entry.
+
+        Turning it off is the escape hatch, so it never fails: everything commanded
+        is dropped and the device hands control back on its own once the heartbeat
+        stops, whether or not the clearing write gets through.
+        """
         if enabled == self._heartbeat_enabled:
             return
 
-        self._heartbeat_enabled = enabled
-        self._last_heartbeat_time = None
         if enabled:
+            self._heartbeat_enabled = True
             # Re-probe, so an earlier rejection does not survive a manual retry.
             self._heartbeat_supported = None
             # The device released control while the heartbeat was off.
+            self._last_heartbeat_time = None
             self._control_stale = True
             await self.async_send_heartbeat(force=True)
+        else:
+            self._power_saving = False
+            await self._async_stop_commanding(ControlIntent.AUTOMATIC)
+            self._heartbeat_enabled = False
+            self._last_heartbeat_time = None
 
         _LOGGER.info("Modbus heartbeat %s", "enabled" if enabled else "disabled")
         self.async_update_listeners()
 
     async def _async_require_control_authority(self) -> None:
-        """Make sure the device will act on the write that follows.
+        """Take control of the device, so the write that follows is acted on.
 
-        The device stores every write, but only acts on them while the heartbeat is
-        current, so a write without authority would look successful and do nothing.
+        The device stores every write but only acts on it while the heartbeat is
+        current, so the heartbeat is armed on demand rather than left to the user.
         """
         if not self._heartbeat_enabled:
-            _LOGGER.warning(
-                "Heartbeat is disabled: the device will store this write but is "
-                "unlikely to act on it. Enable the heartbeat switch for control."
-            )
-            return
+            self._heartbeat_enabled = True
+            self._heartbeat_supported = None
+            self._last_heartbeat_time = None
+            _LOGGER.info("Taking Modbus control: the EcoFlow app will lose control")
 
         if not await self.async_send_heartbeat(force=True):
             raise HomeAssistantError(
@@ -462,35 +506,166 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 "rejected, so the device would ignore the command. Nothing written."
             )
 
-    # ── System control command (0x0215) ───────────────────────────────────────
+    def _release_control_authority(self) -> None:
+        """Stop the heartbeat when nothing is commanded, giving the app control back.
+
+        Releasing needs no I/O: the device reverts to the app by itself once the
+        heartbeat stops, which is why this can never fail.
+        """
+        if not self._heartbeat_enabled or self._power_saving:
+            return
+        if self._control_intent is not ControlIntent.AUTOMATIC:
+            return
+        self._heartbeat_enabled = False
+        self._last_heartbeat_time = None
+        _LOGGER.info("Releasing Modbus control back to the EcoFlow app")
 
     def _compose_control_command(self) -> int:
-        """Build the control word from the commanded method and power-saving state."""
-        method = self._control_method.command_value
-        if method is None:
-            method = ControlMode.DEFAULT.command_value
+        """Build the control word from the commanded intent and power-saving state.
+
+        System control command (0x0215)
+        """
+        method = self.control_method.command_value or 0
         word = (method & CONTROL_COMMAND_METHOD_MASK) << CONTROL_COMMAND_METHOD_SHIFT
         if self._power_saving:
             word |= 1 << CONTROL_COMMAND_POWER_SAVING_BIT
         return word
 
-    async def async_set_control_method(self, method: ControlMode) -> None:
-        """Command a control method. Setpoints only take effect while theirs is active."""
-        if method.command_value is None:
-            raise HomeAssistantError(f"Control method {method} cannot be commanded")
+    def _seed_control_power(self, intent: ControlIntent) -> float:
+        """Return a starting power that makes engaging *intent* a no-op.
 
-        # Re-selecting the current method is a deliberate re-send, so no early return.
-        previous = self._control_method
-        self._control_method = method
-        self._control_method_adopted = True
+        Entering a mode with whatever the setpoint register happens to hold would
+        apply a stale command from a previous session, so the intent starts by
+        telling the device to keep doing what it is already doing.
+        """
+        definition = CONTROL_INTENTS[intent]
+        if definition.seed_key is None:
+            return 0.0
+        measured = (self.data or {}).get(definition.seed_key)
+        if measured is None:
+            raise HomeAssistantError(
+                f"Cannot switch to {intent}: {definition.seed_key} has not been read "
+                "yet, so there is no safe starting point for the setpoint."
+            )
+        return self._clamp_control_power(float(measured) * definition.sign, intent)
+
+    def _clamp_control_power(self, watts: float, intent: ControlIntent) -> float:
+        """Clamp a magnitude to zero and the device's own ceiling for *intent*."""
+        return max(0.0, min(float(watts), self._control_power_ceiling(intent)))
+
+    async def async_set_control_intent(self, intent: ControlIntent) -> None:
+        """Command an intent, seeding its setpoint so the change itself does nothing."""
+        definition = CONTROL_INTENTS[intent]
+        if not definition.controls_power:
+            await self._async_stop_commanding(intent)
+            return
+
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
+
+        seeded = self._seed_control_power(intent)
+        previous_intent = self._control_intent
+        previous_power = self._control_power
+        self._control_intent = intent
+        self._control_power = seeded
+
         try:
+            await self._async_require_control_authority()
+            await self._async_write_setpoint(intent, seeded)
             await self._async_apply_control_command()
         except HomeAssistantError:
-            self._control_method = previous
+            self._control_intent = previous_intent
+            self._control_power = previous_power
             raise
 
+        self.async_update_listeners()
+
+    async def _async_stop_commanding(self, intent: ControlIntent) -> None:
+        """Hand the inverter back to itself. Never raises.
+
+        The clearing write is best effort because it is not what actually releases
+        the device: stopping the heartbeat does, after the device's own timeout.
+        """
+        already_idle = self._control_intent is intent
+        self._control_intent = intent
+        self._control_power = 0.0
+
+        if not already_idle and self.connected and self._heartbeat_enabled:
+            try:
+                await self._async_write_control_word(self._compose_control_command())
+            except HomeAssistantError as err:
+                _LOGGER.warning(
+                    "Could not clear the control word (%s); the device hands control "
+                    "back on its own within %ss",
+                    err,
+                    HEARTBEAT_LAPSE_S,
+                )
+
+        self._release_control_authority()
+        self.async_update_listeners()
+
+    async def async_set_control_power(self, watts: float) -> None:
+        """Change the magnitude for the active intent. Automatic has nothing to set."""
+        definition = CONTROL_INTENTS[self._control_intent]
+        if not definition.controls_power:
+            raise HomeAssistantError(
+                "Select a control mode other than automatic before setting a power"
+            )
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
+
+        clamped = self._clamp_control_power(watts, self._control_intent)
+        previous = self._control_power
+        self._control_power = clamped
+        try:
+            await self._async_require_control_authority()
+            await self._async_write_setpoint(self._control_intent, clamped)
+        except HomeAssistantError:
+            self._control_power = previous
+            raise
+
+        self.async_update_listeners()
+
+    async def _async_write_setpoint(self, intent: ControlIntent, watts: float) -> None:
+        """Write the register the intent's method acts on, with the intent's sign."""
+        definition = CONTROL_INTENTS[intent]
+        if definition.setpoint_key is None:
+            return
+        register = REGISTERS_BY_KEY[definition.setpoint_key]
+        value = int(round(watts)) * definition.sign
+
+        try:
+            words = encode_register(value, RegisterType.INT32)
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+
+        _LOGGER.debug(
+            "Sending Modbus write command [FC16]: %sW as %s to address %s (%s)",
+            value,
+            [f"0x{word:04X}" for word in words],
+            register.address,
+            definition.setpoint_key,
+        )
+
+        try:
+            async with self._lock:
+                response = await self._client.write_registers(
+                    address=register.address,
+                    values=words,
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(
+                f"Setpoint {value} W could not be sent to {register.address}: {err!r}"
+            ) from err
+
+        if response.isError():
+            raise HomeAssistantError(
+                f"Modbus rejected setpoint {value} W to {register.address}: {response}"
+            )
+
     async def async_set_power_saving(self, enabled: bool) -> None:
-        """Command power-saving mode without disturbing the control method."""
+        """Command power-saving mode without disturbing the control intent."""
         previous = self._power_saving
         self._power_saving = enabled
         try:
@@ -498,6 +673,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         except HomeAssistantError:
             self._power_saving = previous
             raise
+        self._release_control_authority()
 
     async def _async_apply_control_command(self) -> None:
         """Write the composed control word once and refresh so the read-back shows it."""
@@ -513,13 +689,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         await self._async_require_control_authority()
         await self._async_write_control_word(value)
         self._last_control_write_time = dt.now()
-        self._control_mismatch_logged = False
         self._control_stale = False
         self.async_update_listeners()
-
-        # The register itself cannot be read; System State 2 is the read-back. The
-        # poll does not re-send the word unless the device disagrees for a while, so
-        # this refresh cannot turn into a second write.
         await self.async_refresh()
 
     async def _async_write_control_word(self, value: int) -> None:
@@ -534,7 +705,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             async with self._lock:
                 response = await self._client.write_registers(
                     address=CONTROL_COMMAND_REGISTER,
-                    values=[value & 0xFFFF, (value >> 16) & 0xFFFF],
+                    values=encode_register(value, RegisterType.UINT32),
                     device_id=self._client_slave_id,
                 )
         except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
@@ -547,106 +718,39 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 f"Modbus rejected control command 0x{value:08X}: {response}"
             )
 
-    def _adopt_reported_state(self, data: dict[str, Any]) -> None:
-        """On the first read, take over what the device is already doing.
-
-        After a restart the device is still running the last commanded method, so
-        starting from Default would misreport the state and would never restore it.
-        Power saving is seeded from the low-power status bit, the only hint there
-        is; it is a best guess because that bit is only set once the inverter idles.
-        """
-        if self._control_method_adopted:
-            return
-        reported = self.reported_control_method(data)
-        if reported is None or reported.command_value is None:
-            return
-        self._control_method = reported
-        self._control_method_adopted = True
-        if (low_power := self.reported_low_power(data)) is not None:
-            self._power_saving = low_power
-        if reported is not ControlMode.DEFAULT or self._power_saving:
-            _LOGGER.info(
-                "Adopted device state: control method %s, power saving %s",
-                reported,
-                self._power_saving,
-            )
-
     async def _async_reconcile_control_command(self, data: dict[str, Any]) -> None:
-        """Keep the device on the commanded word without blindly re-writing it.
+        """Re-send the command after a control-authority lapse, and only then.
 
-        Two cases warrant a write: control authority lapsed (the device then falls
-        back to the app settings, so anything commanded, including power saving, is
-        gone), or the device reports a control method other than the commanded one.
-        Blindly re-writing every poll forced the method back to Default around any
-        manual change and, if bit 3 were edge-triggered, toggled power saving.
+        Losing the heartbeat window makes the device fall back to the app settings,
+        so both the setpoint and the control word have to go out again. There is no
+        read-back to compare against: System State 2 is not implemented on every
+        model, so a poll never second-guesses what was commanded.
         """
         if not self._heartbeat_enabled or self._heartbeat_supported is False:
-            # Without authority the device will not follow anyway; don't fight it.
             return
-        if not self._control_method_adopted:
+        if not self._control_stale:
             return
 
-        commanding_something = (
-            self._control_method is not ControlMode.DEFAULT or self._power_saving
-        )
-
-        if self._control_stale:
-            if not commanding_something:
-                self._control_stale = False
-                return
-            word = self._compose_control_command()
-            _LOGGER.info(
-                "Re-sending control word 0x%08X after a control-authority lapse", word
-            )
-            try:
-                await self._async_write_control_word(word)
-            except HomeAssistantError as err:
-                _LOGGER.debug(f"Control command re-send failed: {err!r}")
-                return
-            self._last_control_write_time = dt.now()
+        definition = CONTROL_INTENTS[self._control_intent]
+        if not definition.controls_power and not self._power_saving:
             self._control_stale = False
             return
 
-        if self._control_method is ControlMode.DEFAULT:
-            # Nothing that needs holding; power saving alone has no reliable read-back.
-            return
-
-        reported = self.reported_control_method(data)
-        if reported is None:
-            return
-        if reported is self._control_method:
-            if self._control_mismatch_logged:
-                _LOGGER.info(
-                    "Device now reports control method %s as commanded", reported
-                )
-                self._control_mismatch_logged = False
-            return
-
-        now = dt.now()
-        if (
-            self._last_control_write_time is not None
-            and (now - self._last_control_write_time).total_seconds()
-            < CONTROL_COMMAND_REASSERT_INTERVAL_S
-        ):
-            return
-
         word = self._compose_control_command()
-        log = _LOGGER.debug if self._control_mismatch_logged else _LOGGER.warning
-        log(
-            "Device reports control method %s while %s is commanded; re-sending "
-            "0x%08X. If this repeats, the device is not accepting the control word "
-            "(check heartbeat, Pro-app Modbus control, word order, unit ID).",
-            reported,
-            self._control_method,
-            word,
+        _LOGGER.info(
+            "Re-sending control word 0x%08X after a control-authority lapse", word
         )
-        self._control_mismatch_logged = True
-
         try:
+            if definition.controls_power:
+                await self._async_write_setpoint(
+                    self._control_intent, self._control_power
+                )
             await self._async_write_control_word(word)
-            self._last_control_write_time = now
         except HomeAssistantError as err:
-            _LOGGER.debug(f"Control command re-assert failed: {err!r}")
+            _LOGGER.debug(f"Control command re-send failed: {err!r}")
+            return
+        self._last_control_write_time = dt.now()
+        self._control_stale = False
 
     def _log_state_word_changes(self, data: dict[str, Any]) -> None:
         """Trace the raw status words, so any reaction to a command is visible."""
@@ -662,8 +766,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 int(new_value),
                 self._compose_control_command(),
             )
-
-    # ── Polling ───────────────────────────────────────────────────────────────
 
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -696,9 +798,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S)
                 return None
 
-            self._adopt_reported_state(data)
             await self._async_reconcile_control_command(data)
-
             return data
         except ModbusException as err:
             _LOGGER.debug(f"{err.string}. Connection closing...")
@@ -760,8 +860,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     ) -> None:
         """Write a parameter or setpoint register and verify it by reading it back.
 
-        UINT16 registers go out with FC6; INT32/UINT32 with FC16, low word first,
-        the same order the read path decodes.
+        UINT16 registers go out with FC6; INT32/UINT32 with FC16, high word first,
+        which is the order the device parses writes in (see `encode_register`).
         """
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
@@ -776,18 +876,18 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError(str(err)) from err
 
         required = entity_def.requires_control_method
-        if required is not None and required is not self._control_method:
-            _LOGGER.warning(
-                "%s only takes effect while the control method is %s, but %s is "
-                "commanded. The value is stored; select the control method for the "
-                "device to act on it.",
-                key,
-                required,
-                self._control_method,
-            )
-
-        # The device silently ignores writes when control authority has lapsed.
-        await self._async_require_control_authority()
+        if required is not None:
+            if required is not self.control_method:
+                _LOGGER.warning(
+                    "%s only takes effect while the control method is %s, but %s is "
+                    "commanded. The value is stored; select the matching control "
+                    "mode for the device to act on it.",
+                    key,
+                    required,
+                    self.control_method,
+                )
+            # The device silently ignores setpoints when control authority has lapsed.
+            await self._async_require_control_authority()
 
         _LOGGER.debug(
             "Sending Modbus write command [%s]: value %s -> %s to address %s (Key: %s, Device ID: %s)",
@@ -834,7 +934,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             ) from err
 
         readback_value = decode_register(readback_words, entity_def.data_type)
-        if readback_value is None or int(readback_value) != target_value:
+        # A 32-bit register echoes the words just written and only swaps them into
+        # read order a few seconds later, so either form means the write landed.
+        if readback_words != words and (
+            readback_value is None or int(readback_value) != target_value
+        ):
             raise HomeAssistantError(
                 f"Register {register_address} acknowledged value {target_value}, "
                 f"but read back {readback_value}"

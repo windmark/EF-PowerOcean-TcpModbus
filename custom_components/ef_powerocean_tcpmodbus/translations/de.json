@@ -90,6 +90,7 @@
         "powerocean_single_phase": "PowerOcean 1-phasig",
         "powerocean_three_phase": "PowerOcean 3-phasig",
         "powerocean_plus": "PowerOcean Plus",
+        "powerocean_dc_fit": "PowerOcean DC Fit",
         "ocean_2": "Ocean 2"
       }
     }
@@ -340,18 +341,14 @@
           "islanded": "Inselbetrieb"
         }
       },
-      "control_mode": {
-        "name": "Steuerungsmodus",
-        "state": {
-          "default": "Standard",
-          "system_feed": "System-Einspeisung/-Bezug",
-          "inverter_feed": "Wechselrichter-Einspeisung/-Bezug",
-          "battery_limits": "Batterie-Lade-/Entladegrenzen",
-          "unknown": "Unbekannt"
-        }
+      "inverter_output_power": {
+        "name": "Wechselrichter-Ausgangsleistung"
       }
     },
     "binary_sensor": {
+      "modbus_control": {
+        "name": "Modbus-Steuerung"
+      },
       "self_use_mode_ena": {
         "name": "Eigenstromversorgung"
       },
@@ -369,11 +366,36 @@
       }
     },
     "number": {
+      "control_power_control": {
+        "name": "Steuerungsleistung"
+      },
       "min_soc_limit_control": {
         "name": "Batterie Backup-Reserve Steuerung"
       },
       "device_led_brightness_control": {
         "name": "Helligkeit LED-Geräteanzeige Steuerung"
+      },
+      "system_power_setpoint_control": {
+        "name": "Sollwert Systemleistung"
+      },
+      "inverter_power_setpoint_control": {
+        "name": "Sollwert Wechselrichterleistung"
+      },
+      "battery_power_setpoint_control": {
+        "name": "Sollwert Batterieleistung"
+      }
+    },
+    "select": {
+      "control_mode_control": {
+        "name": "Steuerungsmodus",
+        "state": {
+          "automatic": "Automatisch",
+          "charge_battery": "Batterie laden mit",
+          "discharge_battery": "Batterie entladen mit",
+          "import_from_grid": "Netzbezug von",
+          "export_to_grid": "Netzeinspeisung von",
+          "limit_inverter_output": "Wechselrichterleistung begrenzen auf"
+        }
       }
     },
     "switch": {

@@ -52,9 +52,16 @@ Best practice is to configure a static IP in your router's admin interface. Othe
 ## Data types and word order
 
 Modbus registers are 16 bits, so anything wider spans consecutive registers.
-Multi-word values are stored low word first.
+**Reads and writes disagree about word order**, and the vendor doc contradicts
+itself on the point. What the hardware actually does, measured on a PowerOcean
+Plus:
 
-For a 32-bit value at address _N_:
+| Direction      | Word order          |
+| -------------- | ------------------- |
+| Read (`0x03`)  | low word first      |
+| Write (`0x10`) | **high word first** |
+
+For a 32-bit value read from address _N_:
 
 | Word | Address | Contents |
 | -- | - | |
@@ -63,6 +70,17 @@ For a 32-bit value at address _N_:
 
 A `battery_capacity` of 100000 Wh (`0x000186A0`) therefore arrives as
 `registers[0] = 0x86A0` and `registers[1] = 0x0001`.
+
+A write of the same value must send `0x0001` first and `0x86A0` second. Sending it
+in read order is not rejected: the device stores the words, interprets them high
+word first, and acts on a value 65536 times too large. This is what makes a 32-bit
+write look like it succeeded while nothing happens — see
+[Writing registers](#writing-registers).
+
+The proof is the device's own read-back. Write `500` to the battery power setpoint
+low word first and a few seconds later the register reads `32768000` (= 500 << 16),
+because the device re-publishes its internal value in read order. Write it high
+word first and the register reads `500`, and the inverter follows the setpoint.
 
 Four layouts occur, modelled as `RegisterType` in `models.py`:
 
@@ -135,8 +153,27 @@ browser's network tab. The extra data falls roughly into these groups:
 
 Writable registers are declared in `WRITABLE_NUMBERS_MAP`. Each entry names the
 register it reads from, and the write address is resolved from that same
-`RegisterDef`, so read and write addresses cannot diverge. Writes use function code
-`0x06` and are read back to confirm the device accepted the value.
+`RegisterDef`, so read and write addresses cannot diverge. 16-bit registers are
+written with function code `0x06`, 32-bit ones with `0x10` and the high word first
+(`encode_register`).
+
+Read-back proves only that the words arrived, never that the device acted on them.
+Immediately after a 32-bit write the register still holds the words as sent; the
+firmware swaps them into read order a few seconds later. Both forms count as
+confirmation of delivery, and nothing more.
+
+Two registers cannot be verified by reading at all on a PowerOcean Plus:
+
+- `0x0215` System Control Command is write-only by design and accepts any value,
+  including bit patterns the doc reserves. It is not validated.
+- `0x0213` System State 2 reads `0x00000000` even while `0x0211` reports the system
+  running, although its low seven bits are documented to mirror `0x0211`. The
+  register is not implemented, so the `control_mode` sensor derived from it always
+  says "default". Do not use it to decide whether a command was accepted.
+
+The only trustworthy confirmation is behavioural: grid, battery or solar power
+moving, the LED changing, or the EcoFlow Pro app reporting that Modbus has control.
+`scripts/probe_control_word.py` tests exactly that against a real device.
 
 Writing to a live inverter can interfere with its internal scheduling. Treat every
 writable register as potentially disruptive, and change them one at a time.

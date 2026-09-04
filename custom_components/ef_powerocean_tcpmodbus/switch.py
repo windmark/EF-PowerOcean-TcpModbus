@@ -51,7 +51,13 @@ class EcoFlowSwitch(EcoFlowBaseEntity, SwitchEntity):
 
 
 class EcoFlowHeartbeatSwitch(EcoFlowSwitch):
-    """Gates the Modbus keepalive that grants the integration control authority."""
+    """Manual override for the keepalive that grants Modbus control authority.
+
+    The control mode arms and releases this on its own, so it is off the entity list
+    unless someone enables it to debug or to hold control open deliberately.
+    """
+
+    _attr_entity_registry_enabled_default = False
 
     @property
     def available(self) -> bool:
@@ -67,6 +73,7 @@ class EcoFlowHeartbeatSwitch(EcoFlowSwitch):
         return {
             "accepted_by_device": self.coordinator.heartbeat_supported,
             "last_sent": self.coordinator.last_heartbeat_time,
+            "in_control": self.coordinator.in_control,
         }
 
     async def async_turn_on(self, **kwargs: Any) -> None:
@@ -79,8 +86,8 @@ class EcoFlowHeartbeatSwitch(EcoFlowSwitch):
 class EcoFlowPowerSavingSwitch(EcoFlowSwitch):
     """Power-saving mode, bit 3 of the write-only control command.
 
-    The coordinator composes the control word from this bit and the selected
-    control method, so toggling here no longer resets the method to Default.
+    The coordinator composes the control word from this bit and the selected control
+    mode, so toggling here never disturbs the mode. It arms the heartbeat by itself.
     """
 
     @property
