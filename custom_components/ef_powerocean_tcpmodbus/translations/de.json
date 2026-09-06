@@ -319,7 +319,10 @@
         "name": "Anzahl aktiver Fehler"
       },
       "active_faults": {
-        "name": "Aktive Fehlercodes"
+        "name": "Aktive Fehlercodes",
+        "state": {
+          "none": "Keine"
+        }
       },
       "grid_mode": {
         "name": "Netzmodus",
@@ -340,10 +343,18 @@
         "name": "Batteriesparmodus"
       },
       "system_fault": {
-        "name": "Systemfehler"
+        "name": "Systemfehler",
+        "state": {
+          "off": "OK",
+          "on": "Fehler"
+        }
       },
       "system_power_on": {
-        "name": "System eingeschaltet"
+        "name": "System eingeschaltet",
+        "state": {
+          "on": "Läuft",
+          "off": "Aus"
+        }
       }
     },
     "number": {
