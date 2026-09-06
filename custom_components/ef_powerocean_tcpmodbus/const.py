@@ -11,7 +11,6 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfFrequency,
     UnitOfPower,
-    UnitOfRatio,
     UnitOfTemperature,
 )
 
@@ -56,10 +55,14 @@ MAX_BATTERY_COUNT: Final = 12
 MAX_FAULT_EVENTS: Final = 20
 
 SLEEP_TIME_AFTER_RECONNECT_S: Final = 1
-SLEEP_TIME_AFTER_BATTERY_CHECK_FAILED_S: Final = 15
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
 STATE_SAVE_DELAY_S: Final = 30
+MODBUS_DISABLED_READ_THRESHOLD: Final = 3
+
+# Home Assistant only introdcued UnitOfRatio in 2026.7, so for backwards compatibility
+# we hardcode this
+UNIT_OF_RATIO: Final = "%"
 
 DEFAULT_INVERTER_MODEL: Final = InverterModel.POWEROCEAN_THREE_PHASE
 
@@ -173,13 +176,13 @@ SENSOR_MAP: list[SensorDef] = [
     ),
     SensorDef(
         key="battery_soc",
-        unit=UnitOfRatio.PERCENTAGE,
+        unit=UNIT_OF_RATIO,
         device_class="battery",
         state_class="measurement",
     ),
     SensorDef(
         key="min_soc_limit",
-        unit=UnitOfRatio.PERCENTAGE,
+        unit=UNIT_OF_RATIO,
         device_class="battery",
         state_class="measurement",
     ),
@@ -197,7 +200,7 @@ SENSOR_MAP: list[SensorDef] = [
     ),
     SensorDef(
         key="device_led_brightness",
-        unit=UnitOfRatio.PERCENTAGE,
+        unit=UNIT_OF_RATIO,
         device_class=None,
         state_class="measurement",
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -363,10 +366,31 @@ SENSOR_MAP: list[SensorDef] = [
         state_class="measurement",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+    SensorDef(
+        key="soc_battery_1",
+        unit=UNIT_OF_RATIO,
+        device_class="battery",
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="soc_battery_2",
+        unit=UNIT_OF_RATIO,
+        device_class="battery",
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="soc_battery_3",
+        unit=UNIT_OF_RATIO,
+        device_class="battery",
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
     *[
         SensorDef(
             key=key,
-            unit=UnitOfRatio.PERCENTAGE,
+            unit=UNIT_OF_RATIO,
             device_class="battery",
             state_class="measurement",
             entity_category=EntityCategory.DIAGNOSTIC,
@@ -533,7 +557,7 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         min_value=0.0,
         max_value=100.0,
         step=1.0,
-        unit=UnitOfRatio.PERCENTAGE,
+        unit=UNIT_OF_RATIO,
         device_class="battery",
     ),
     NumberWritableDef(
@@ -544,7 +568,7 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         min_value=0.0,
         max_value=100.0,
         step=10.0,
-        unit=UnitOfRatio.PERCENTAGE,
+        unit=UNIT_OF_RATIO,
         icon="mdi:led-on",
     ),
 ]

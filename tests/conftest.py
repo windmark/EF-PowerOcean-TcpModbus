@@ -27,7 +27,6 @@ homeassistant_const.Platform = type(
 homeassistant_const.EntityCategory = StrEnum(
     "EntityCategory", {"CONFIG": "config", "DIAGNOSTIC": "diagnostic"}
 )
-homeassistant_const.UnitOfRatio = StrEnum("UnitOfRatio", {"PERCENTAGE": "%"})
 homeassistant_const.UnitOfElectricCurrent = StrEnum(
     "UnitOfElectricCurrent", {"AMPERE": "A"}
 )
