@@ -5,8 +5,8 @@ The values that fill these in live in const.py; this module must not import it.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final
 
@@ -117,6 +117,15 @@ class RegisterDef:
     key: str
     address: int
     data_type: RegisterType = RegisterType.FLOAT32
+    address_overrides: Mapping[InverterModel, int] = field(default_factory=dict)
+
+    def for_model(self, inverter_model: InverterModel) -> RegisterDef:
+        """Return a concrete register definition for an inverter model."""
+        return replace(
+            self,
+            address=self.address_overrides.get(inverter_model, self.address),
+            address_overrides={},
+        )
 
     @property
     def size(self) -> int:
@@ -181,6 +190,13 @@ def plan_blocks(registers: Iterable[RegisterDef]) -> tuple[RegisterBlock, ...]:
     if current:
         blocks.append(RegisterBlock(tuple(current)))
     return tuple(blocks)
+
+
+def plan_blocks_for_model(
+    registers: Iterable[RegisterDef], inverter_model: InverterModel
+) -> tuple[RegisterBlock, ...]:
+    """Resolve model-specific addresses and group them into Modbus reads."""
+    return plan_blocks(register.for_model(inverter_model) for register in registers)
 
 
 @dataclass(frozen=True)

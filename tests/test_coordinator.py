@@ -26,6 +26,7 @@ def coordinator():
     instance._consecutive_modbus_disabled_reads = 0
     instance._ena_calc_solar_power = False
     instance.inverter_model = const.DEFAULT_INVERTER_MODEL
+    instance._register_blocks = const.register_blocks_for(instance.inverter_model)
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
         const.CONF_MAX_SOLAR_POWER: 12_000,
@@ -576,7 +577,7 @@ def test_gets_and_decodes_raw_data(
             models.RegisterDef("grid_power", 101, models.RegisterType.UINT16),
         )
     )
-    monkeypatch.setattr(coordinator_module, "REGISTER_BLOCKS", (block,))
+    coordinator._register_blocks = (block,)
     decode_register = Mock(side_effect=(2.0, 42.0))
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     coordinator._client = SimpleNamespace(connected=True)
@@ -599,7 +600,7 @@ def test_modbus_disabled_recovers_when_telemetry_returns(
             models.RegisterDef("limit_inv_max", 102, models.RegisterType.UINT16),
         )
     )
-    monkeypatch.setattr(coordinator_module, "REGISTER_BLOCKS", (block,))
+    coordinator._register_blocks = (block,)
     disabled_frame = (0.0, 0.0, 0.0)
     enabled_frame = (2.0, 6000.0, 5000.0)
     decode_register = Mock(
@@ -633,8 +634,18 @@ def test_modbus_disabled_recovers_when_telemetry_returns(
 
 @pytest.mark.parametrize(
     "registers",
-    (const.MODBUS_REGISTERS, const.DEVICE_INFO_BLOCK.registers),
-    ids=("polled", "device-info"),
+    (
+        *(
+            tuple(
+                register
+                for block in const.register_blocks_for(inverter_model)
+                for register in block.registers
+            )
+            for inverter_model in models.InverterModel
+        ),
+        const.DEVICE_INFO_BLOCK.registers,
+    ),
+    ids=(*models.InverterModel, "device-info"),
 )
 def test_registers_do_not_overlap(registers: tuple[models.RegisterDef, ...]) -> None:
     """A multi-word register must not extend into the next register's address."""
@@ -647,16 +658,12 @@ def test_registers_do_not_overlap(registers: tuple[models.RegisterDef, ...]) -> 
         )
 
 
-def test_blocks_cover_every_register_word_they_map() -> None:
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_blocks_cover_every_register_word_they_map(
+    inverter_model: models.InverterModel,
+) -> None:
     """Every register must decode from inside the block that was read for it."""
-    mapped = [
-        register for block in const.REGISTER_BLOCKS for register in block.registers
-    ]
-
-    assert sorted(register.key for register in mapped) == sorted(
-        register.key for register in const.MODBUS_REGISTERS
-    )
-    for block in const.REGISTER_BLOCKS:
+    for block in const.register_blocks_for(inverter_model):
         for register in block.registers:
             index = block.index_of(register)
 
@@ -668,6 +675,28 @@ def test_blocks_cover_every_register_word_they_map() -> None:
                 f"{register.key} needs words {index}-{index + register.size - 1} "
                 f"but the block at {block.start} only reads {block.count}"
             )
+
+
+@pytest.mark.parametrize(
+    ("inverter_model", "expected_address"),
+    (
+        (inverter_model, 40538)
+        if inverter_model == models.InverterModel.POWEROCEAN_PLUS
+        else (inverter_model, 40609)
+        for inverter_model in models.InverterModel
+    ),
+)
+def test_feed_in_power_max_address_depends_on_inverter_model(
+    inverter_model: models.InverterModel, expected_address: int
+) -> None:
+    register = next(
+        register
+        for block in const.register_blocks_for(inverter_model)
+        for register in block.registers
+        if register.key == "feed_in_power_max"
+    )
+
+    assert register.address == expected_address
 
 
 def test_writable_numbers_write_to_the_register_they_read() -> None:
@@ -746,9 +775,13 @@ def test_device_info_read_failure_closes_connection(coordinator) -> None:
     coordinator._client.close.assert_called_once()
 
 
-def test_read_plan_is_not_split_more_than_necessary() -> None:
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_read_plan_is_not_split_more_than_necessary(
+    inverter_model: models.InverterModel,
+) -> None:
     """Neighbouring blocks must be unmergeable, so no poll wastes a round trip."""
-    for block, following in zip(const.REGISTER_BLOCKS, const.REGISTER_BLOCKS[1:]):
+    blocks = const.register_blocks_for(inverter_model)
+    for block, following in zip(blocks, blocks[1:]):
         gap = following.start - (block.start + block.count)
         merged = following.start + following.count - block.start
 

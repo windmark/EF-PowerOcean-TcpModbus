@@ -44,11 +44,11 @@ from .const import (
     MODBUS_DISABLED_READ_THRESHOLD,
     PRODUCT_CATEGORY,
     PRODUCT_NUMBER,
-    REGISTER_BLOCKS,
     SERIAL_NUMBER,
     SLEEP_TIME_AFTER_RECONNECT_S,
     STATE_SAVE_DELAY_S,
     STORAGE_VERSION,
+    register_blocks_for,
 )
 from .energy_processor import EnergyProcessor
 from .models import CoordinatorStatus, InverterModel, NumberWritableDef
@@ -101,6 +101,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self.inverter_model = InverterModel(
             config_entry.data.get(CONF_INVERTER_MODEL, DEFAULT_INVERTER_MODEL)
         )
+        self._register_blocks = register_blocks_for(self.inverter_model)
         super().__init__(
             hass,
             _LOGGER,
@@ -270,7 +271,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         try:
             # Read all register blocks
-            for register_block in REGISTER_BLOCKS:
+            for register_block in self._register_blocks:
                 raw = await self.async_read_block(
                     register_block.start, register_block.count
                 )

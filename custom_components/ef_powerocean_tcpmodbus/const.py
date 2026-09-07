@@ -26,7 +26,7 @@ from .models import (
     RegisterDef,
     RegisterType,
     SensorDef,
-    plan_blocks,
+    plan_blocks_for_model,
 )
 
 DOMAIN: Final = "ef_powerocean_tcpmodbus"
@@ -93,7 +93,12 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
     RegisterDef("inverter_rated_power", 40528, RegisterType.UINT32),
     RegisterDef("system_modes", 40530, RegisterType.UINT32),
     RegisterDef("min_soc_limit", 40536, RegisterType.UINT16),
-    RegisterDef("feed_in_power_max", 40538, RegisterType.UINT32),
+    RegisterDef(
+        "feed_in_power_max",
+        40609,
+        RegisterType.UINT32,
+        address_overrides={InverterModel.POWEROCEAN_PLUS: 40538},
+    ),
     RegisterDef("device_led_brightness", 40541, RegisterType.UINT16),
     RegisterDef("limit_inv_power", 40546, RegisterType.UINT32),
     RegisterDef("limit_inv_max", 40548, RegisterType.UINT32),
@@ -139,8 +144,12 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
     RegisterDef("solar_today", 42259),
 )
 
-REGISTER_BLOCKS: Final = plan_blocks(MODBUS_REGISTERS)
 REGISTERS_BY_KEY: Final = {register.key: register for register in MODBUS_REGISTERS}
+
+
+def register_blocks_for(inverter_model: InverterModel) -> tuple[RegisterBlock, ...]:
+    """Return register blocks resolved for an inverter model."""
+    return plan_blocks_for_model(MODBUS_REGISTERS, inverter_model)
 
 
 SENSOR_MAP: list[SensorDef] = [
