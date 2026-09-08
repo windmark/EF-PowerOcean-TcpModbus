@@ -162,30 +162,28 @@ def test_transport_failure_retries_instead_of_disabling_the_heartbeat(
     assert write.await_count == 1
 
 
-def test_disabling_the_heartbeat_stops_it_and_re_enabling_re_probes(
-    coordinator, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("entry_data", "expected"),
+    [({}, False), ({const.CONF_HEARTBEAT_ENABLED: True}, True)],
+)
+def test_heartbeat_enablement_comes_from_config_entry(
+    monkeypatch: pytest.MonkeyPatch, entry_data: dict, expected: bool
 ) -> None:
-    write = heartbeat_response(coordinator, is_error=True)
-    coordinator.async_update_listeners = Mock()
-    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+    monkeypatch.setattr(
+        coordinator_module.DataUpdateCoordinator,
+        "__init__",
+        lambda self, *args, **kwargs: setattr(self, "data", None),
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "AsyncModbusTcpClient",
+        lambda *args, **kwargs: Mock(connected=False),
+    )
+    config_entry = SimpleNamespace(data=entry_data, entry_id="test")
 
-    # A rejection latches the heartbeat off until something re-probes it.
-    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch)
-    assert coordinator.heartbeat_supported is False
+    instance = coordinator_module.EcoflowCoordinator(Mock(), config_entry)
 
-    coordinator._lock = asyncio.Lock()
-    asyncio.run(coordinator.async_set_heartbeat_enabled(False))
-    assert coordinator.heartbeat_enabled is False
-    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
-    assert write.await_count == 1
-
-    write = heartbeat_response(coordinator, is_error=False)
-    coordinator._lock = asyncio.Lock()
-    asyncio.run(coordinator.async_set_heartbeat_enabled(True))
-
-    assert coordinator.heartbeat_enabled is True
-    assert coordinator.heartbeat_supported is True
-    assert write.await_count == 1
+    assert instance.heartbeat_enabled is expected
 
 
 def set_power_saving(coordinator, enabled: bool):
@@ -377,7 +375,7 @@ def test_engaging_an_intent_takes_control_and_automatic_releases_it(
 def test_commanding_a_mode_never_takes_control_by_itself(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The heartbeat switch is the user's gate; nothing arms or drops it for them."""
+    """The heartbeat config is the user's gate; commands do not change it."""
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
 
@@ -456,25 +454,6 @@ def test_re_selecting_automatic_writes_nothing(
 
     write.assert_not_awaited()
     assert coordinator.heartbeat_enabled is False
-
-
-def test_disabling_the_heartbeat_always_succeeds(
-    coordinator, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The escape hatch cannot depend on a write the device may never answer."""
-    allow_writes(coordinator, monkeypatch)
-    coordinator.data = {"battery_power": 0.0, "battery_charge_power_limit": 5000.0}
-    set_control_intent(coordinator, models.ControlIntent.CHARGE_BATTERY)
-    coordinator._power_saving = True
-    coordinator._client.connected = False
-
-    coordinator._lock = asyncio.Lock()
-    asyncio.run(coordinator.async_set_heartbeat_enabled(False))
-
-    assert coordinator.heartbeat_enabled is False
-    assert coordinator.control_intent is models.ControlIntent.AUTOMATIC
-    # Power saving does not need control authority, so it survives the release.
-    assert coordinator.power_saving_commanded is True
 
 
 def test_power_saving_does_not_take_control_from_the_app(

@@ -21,6 +21,7 @@ from pymodbus.exceptions import ModbusException
 from .const import (
     CONF_BATTERY_COUNT,
     CONF_CALC_SOLAR_POWER,
+    CONF_HEARTBEAT_ENABLED,
     CONF_HOST,
     CONF_INVERTER_MODEL,
     CONF_MAX_BATTERY_CHARGED_POWER,
@@ -148,9 +149,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
         self._last_heartbeat_time: datetime | None = None
-        # Armed by the control intent, not by the user: holding it on would take
-        # control away from the EcoFlow app for no reason.
-        self._heartbeat_enabled = False
+        self._heartbeat_enabled = config_entry.data.get(CONF_HEARTBEAT_ENABLED, False)
         # None until the device has answered once, so an unsupported model is logged once.
         self._heartbeat_supported: bool | None = None
 
@@ -475,38 +474,12 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_heartbeat_time = now
         return True
 
-    async def async_set_heartbeat_enabled(self, enabled: bool) -> None:
-        """Take or give up Modbus control. This is the user's gate on commanding.
-
-        Turning it off never fails: the control mode is dropped and the device hands
-        control back on its own once the heartbeat stops, whether or not the clearing
-        write gets through. Power saving is left alone, as it needs no authority.
-        """
-        if enabled == self._heartbeat_enabled:
-            return
-
-        if enabled:
-            self._heartbeat_enabled = True
-            # Re-probe, so an earlier rejection does not survive a manual retry.
-            self._heartbeat_supported = None
-            # The device released control while the heartbeat was off.
-            self._last_heartbeat_time = None
-            self._control_stale = True
-            await self.async_send_heartbeat(force=True)
-        else:
-            await self._async_stop_commanding(ControlIntent.AUTOMATIC)
-            self._heartbeat_enabled = False
-            self._last_heartbeat_time = None
-
-        _LOGGER.info("Modbus heartbeat %s", "enabled" if enabled else "disabled")
-        self.async_update_listeners()
-
     def _require_modbus_control(self) -> None:
         """Refuse a command the device would store and ignore."""
         if not self._heartbeat_enabled:
             raise HomeAssistantError(
-                "Modbus control is off. Turn on the Modbus Heartbeat switch to "
-                "command the inverter; nothing was written."
+                "Modbus control is off. Enable the Modbus heartbeat in the "
+                "integration configuration to command the inverter; nothing was written."
             )
 
     async def _async_require_control_authority(self) -> None:

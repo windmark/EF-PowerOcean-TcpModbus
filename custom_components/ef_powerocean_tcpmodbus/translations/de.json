@@ -15,14 +15,15 @@
       },
       "parameters": {
         "title": "EcoFlow PowerOcean",
-        "description": "Einstellungen",
+        "description": "Einstellungen\n\nDurch Aktivieren des Modbus-Heartbeats erhält diese Integration dauerhaft die Kontrolle über den Wechselrichter. Solange er aktiviert ist, kann die EcoFlow-App das System nicht steuern. Deaktivieren Sie ihn, damit die Steuerung in der EcoFlow-App verbleibt.",
         "data": {
           "inverter_model": "Wechselrichtermodell",
           "battery_count": "Anzahl installierter Batterie-Module",
           "solar_power_max": "Maximale Solar-Leistung [W]",
           "grid_power_max": "Maximale Netz-Leistung [W]",
           "scan_interval": "Abfrageintervall [s]",
-          "calc_solar_power": "Berechnung der Solarleistung"
+          "calc_solar_power": "Berechnung der Solarleistung",
+          "heartbeat_enabled": "Modbus-Heartbeat aktivieren"
         },
         "data_description": {
           "inverter_model": "Wählen Sie das Wechselrichtermodell.",
@@ -30,7 +31,8 @@
           "solar_power_max": "Die max. Solar-Leistung wird für die Überprüfung der empfangenen Werte verwendet.",
           "grid_power_max": "Die max. Netz-Leistung wird für die Überprüfung der empfangenen Werte verwendet.",
           "scan_interval": "Wie oft Werte abgefragt werden (2-30 Sekunden)",
-          "calc_solar_power": "Bei einigen Wechselrichtern liefert das Modbus-Register der Solarleistung 0W. Mit diesem Schalter kann die Solarleistung aus den Einzelleistungen der String berechnet werden."
+          "calc_solar_power": "Bei einigen Wechselrichtern liefert das Modbus-Register der Solarleistung 0W. Mit diesem Schalter kann die Solarleistung aus den Einzelleistungen der String berechnet werden.",
+          "heartbeat_enabled": "Übernimmt dauerhaft die Steuerung von der EcoFlow-App und aktiviert Leistungsbefehle an den Wechselrichter."
         }
       },
       "warning": {
@@ -61,14 +63,15 @@
       },
       "parameters": {
         "title": "EcoFlow PowerOcean - Einstellungen",
-        "description": "Einstellungen",
+        "description": "Einstellungen\n\nDurch Aktivieren des Modbus-Heartbeats erhält diese Integration dauerhaft die Kontrolle über den Wechselrichter. Solange er aktiviert ist, kann die EcoFlow-App das System nicht steuern. Deaktivieren Sie ihn, damit die Steuerung in der EcoFlow-App verbleibt.",
         "data": {
           "inverter_model": "Wechselrichtermodell",
           "battery_count": "Anzahl installierter Batterie-Module",
           "solar_power_max": "Maximale Solar-Leistung [W]",
           "grid_power_max": "Maximale Netz-Leistung [W]",
           "scan_interval": "Abfrageintervall [s]",
-          "calc_solar_power": "Berechnung der Solarleistung"
+          "calc_solar_power": "Berechnung der Solarleistung",
+          "heartbeat_enabled": "Modbus-Heartbeat aktivieren"
         },
         "data_description": {
           "inverter_model": "Wählen Sie das Wechselrichtermodell.",
@@ -76,7 +79,8 @@
           "solar_power_max": "Die max. Solar-Leistung wird für die Überprüfung der empfangenen Werte verwendet.",
           "grid_power_max": "Die max. Netz-Leistung wird für die Überprüfung der empfangenen Werte verwendet.",
           "scan_interval": "Wie oft Werte abgefragt werden (2-30 Sekunden)",
-          "calc_solar_power": "Bei einigen Wechselrichtern liefert das Modbus-Register der Solarleistung 0W. Mit diesem Schalter kann die Solarleistung aus den Einzelleistungen der String berechnet werden."
+          "calc_solar_power": "Bei einigen Wechselrichtern liefert das Modbus-Register der Solarleistung 0W. Mit diesem Schalter kann die Solarleistung aus den Einzelleistungen der String berechnet werden.",
+          "heartbeat_enabled": "Übernimmt dauerhaft die Steuerung von der EcoFlow-App und aktiviert Leistungsbefehle an den Wechselrichter."
         }
       }
     },
@@ -401,9 +405,6 @@
       }
     },
     "switch": {
-      "heartbeat_ena": {
-        "name": "Modbus-Heartbeat"
-      },
       "battery_saver_mode_control": {
         "name": "Batteriesparmodus Steuerung"
       }

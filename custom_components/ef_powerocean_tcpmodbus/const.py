@@ -53,6 +53,7 @@ CONF_MAX_BATTERY_CHARGED_POWER: Final = "battery_charged_power_max"
 CONF_MAX_BATTERY_DISCHARGED_POWER: Final = "battery_discharged_power_max"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_CALC_SOLAR_POWER: Final = "calc_solar_power"
+CONF_HEARTBEAT_ENABLED: Final = "heartbeat_enabled"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 
 MAX_BATTERY_CHARGED_POWER: Final = 2500
@@ -632,14 +633,6 @@ MODBUS_CONTROL_BINARY_SENSOR: Final = BinarySensorDef(
     key="modbus_control",
     device_class="running",
     entity_category=EntityCategory.DIAGNOSTIC,
-)
-
-# Local toggle, not a device register: it gates whether the heartbeat is sent, and
-# with it whether the control mode may command the inverter at all.
-HEARTBEAT_SWITCH: Final = SwitchDef(
-    key="heartbeat_ena",
-    entity_category=EntityCategory.CONFIG,
-    icon="mdi:heart-pulse",
 )
 
 # Written as bit 3 of the control command register; read back as battery_saver_mode_ena.
