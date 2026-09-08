@@ -31,8 +31,8 @@ from .models import (
     RegisterType,
     SelectDef,
     SensorDef,
-    plan_blocks_for_model,
     SwitchDef,
+    plan_blocks_for_model,
 )
 
 DOMAIN: Final = "ef_powerocean_tcpmodbus"
