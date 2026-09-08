@@ -15,7 +15,7 @@
       },
       "parameters": {
         "title": "EcoFlow PowerOcean",
-        "description": "Settings\n\nEnabling the Modbus heartbeat gives this integration continuous control of the inverter. While enabled, the EcoFlow app cannot control the system. Disable it to keep control in the EcoFlow app.",
+        "description": "Settings",
         "data": {
           "inverter_model": "Inverter model",
           "battery_count": "Battery module count",
@@ -23,7 +23,7 @@
           "grid_power_max": "Maximum grid power [W]",
           "scan_interval": "Poll Interval [s]",
           "calc_solar_power": "Calculation of solar power",
-          "heartbeat_enabled": "Enable Modbus heartbeat"
+          "modbus_control": "Modbus Control"
         },
         "data_description": {
           "inverter_model": "Select the inverter model.",
@@ -32,7 +32,7 @@
           "grid_power_max": "Maximum grid power",
           "scan_interval": "How often values are polled (2-30 seconds)",
           "calc_solar_power": "In some inverters, the modbus register delivers 0W of solar power. This switch allows the solar power to be calculated from the individual powers of the string.",
-          "heartbeat_enabled": "Continuously takes control from the EcoFlow app and enables inverter power commands."
+          "modbus_control": "Modbus Control gives this integration full control of the inverter. While enabled, the EcoFlow app cannot control the system. You can turn off Modbus Control at any time and the EcoFlow app takes over again after approximately 60 seconds."
         }
       },
       "warning": {
@@ -63,7 +63,7 @@
       },
       "parameters": {
         "title": "EcoFlow PowerOcean - Settings",
-        "description": "Settings\n\nEnabling the Modbus heartbeat gives this integration continuous control of the inverter. While enabled, the EcoFlow app cannot control the system. Disable it to keep control in the EcoFlow app.",
+        "description": "Settings",
         "data": {
           "inverter_model": "Inverter model",
           "battery_count": "Battery module count",
@@ -71,7 +71,7 @@
           "grid_power_max": "Maximum grid power [W]",
           "scan_interval": "Poll Interval [s]",
           "calc_solar_power": "Calculation of solar power",
-          "heartbeat_enabled": "Enable Modbus heartbeat"
+          "modbus_control": "Modbus Control"
         },
         "data_description": {
           "inverter_model": "Select the inverter model.",
@@ -80,7 +80,7 @@
           "grid_power_max": "Maximum grid power",
           "scan_interval": "How often values are polled (2-30 seconds)",
           "calc_solar_power": "In some inverters, the modbus register delivers 0W of solar power. This switch allows the solar power to be calculated from the individual powers of the string.",
-          "heartbeat_enabled": "Continuously takes control from the EcoFlow app and enables inverter power commands."
+          "modbus_control": "Modbus Control gives this integration full control of the inverter. While enabled, the EcoFlow app cannot control the system. You can turn off Modbus Control at any time and the EcoFlow app takes over again after approximately 60 seconds."
         }
       }
     },

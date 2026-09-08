@@ -164,7 +164,7 @@ def test_transport_failure_retries_instead_of_disabling_the_heartbeat(
 
 @pytest.mark.parametrize(
     ("entry_data", "expected"),
-    [({}, False), ({const.CONF_HEARTBEAT_ENABLED: True}, True)],
+    [({}, False), ({const.CONF_MODBUS_CONTROL: True}, True)],
 )
 def test_heartbeat_enablement_comes_from_config_entry(
     monkeypatch: pytest.MonkeyPatch, entry_data: dict, expected: bool

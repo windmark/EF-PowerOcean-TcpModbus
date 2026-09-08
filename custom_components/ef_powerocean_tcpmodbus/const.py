@@ -53,7 +53,7 @@ CONF_MAX_BATTERY_CHARGED_POWER: Final = "battery_charged_power_max"
 CONF_MAX_BATTERY_DISCHARGED_POWER: Final = "battery_discharged_power_max"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_CALC_SOLAR_POWER: Final = "calc_solar_power"
-CONF_HEARTBEAT_ENABLED: Final = "heartbeat_enabled"
+CONF_MODBUS_CONTROL: Final = "modbus_control"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 
 MAX_BATTERY_CHARGED_POWER: Final = 2500

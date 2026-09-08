@@ -20,11 +20,11 @@ from pymodbus.client import AsyncModbusTcpClient
 from .const import (
     CONF_BATTERY_COUNT,
     CONF_CALC_SOLAR_POWER,
-    CONF_HEARTBEAT_ENABLED,
     CONF_HOST,
     CONF_INVERTER_MODEL,
     CONF_MAX_GRID_POWER,
     CONF_MAX_SOLAR_POWER,
+    CONF_MODBUS_CONTROL,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     DEFAULT_BATTERY_COUNT,
@@ -139,7 +139,7 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                         default=False,
                     ): BooleanSelector({}),
                     vol.Required(
-                        CONF_HEARTBEAT_ENABLED,
+                        CONF_MODBUS_CONTROL,
                         default=False,
                     ): BooleanSelector({}),
                 }
@@ -252,10 +252,8 @@ class EcoflowOptionsFlow(OptionsFlow):
                         ),
                     ): BooleanSelector({}),
                     vol.Required(
-                        CONF_HEARTBEAT_ENABLED,
-                        default=self._config_entry.data.get(
-                            CONF_HEARTBEAT_ENABLED, False
-                        ),
+                        CONF_MODBUS_CONTROL,
+                        default=self._config_entry.data.get(CONF_MODBUS_CONTROL, False),
                     ): BooleanSelector({}),
                 }
             ),

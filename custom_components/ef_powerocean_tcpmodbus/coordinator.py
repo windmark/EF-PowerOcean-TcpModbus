@@ -21,13 +21,13 @@ from pymodbus.exceptions import ModbusException
 from .const import (
     CONF_BATTERY_COUNT,
     CONF_CALC_SOLAR_POWER,
-    CONF_HEARTBEAT_ENABLED,
     CONF_HOST,
     CONF_INVERTER_MODEL,
     CONF_MAX_BATTERY_CHARGED_POWER,
     CONF_MAX_BATTERY_DISCHARGED_POWER,
     CONF_MAX_GRID_POWER,
     CONF_MAX_SOLAR_POWER,
+    CONF_MODBUS_CONTROL,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     CONTROL_COMMAND_METHOD_MASK,
@@ -149,7 +149,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
         self._last_heartbeat_time: datetime | None = None
-        self._heartbeat_enabled = config_entry.data.get(CONF_HEARTBEAT_ENABLED, False)
+        self._heartbeat_enabled = config_entry.data.get(CONF_MODBUS_CONTROL, False)
         # None until the device has answered once, so an unsupported model is logged once.
         self._heartbeat_supported: bool | None = None
 
@@ -478,8 +478,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         """Refuse a command the device would store and ignore."""
         if not self._heartbeat_enabled:
             raise HomeAssistantError(
-                "Modbus control is off. Enable the Modbus heartbeat in the "
-                "integration configuration to command the inverter; nothing was written."
+                "Modbus control is off. Enable Modbus Control in the integration "
+                "configuration to command the inverter; nothing was written."
             )
 
     async def _async_require_control_authority(self) -> None:
