@@ -35,7 +35,7 @@ from .const import (
     CONTROL_COMMAND_POWER_SAVING_BIT,
     CONTROL_COMMAND_REGISTER,
     CONTROL_COMMAND_UNSAFE_BITS,
-    CONTROL_INTENTS,
+    CONTROL_FEATURES,
     CONTROL_POWER_FALLBACK_MAX,
     DEFAULT_BATTERY_COUNT,
     DEFAULT_INVERTER_MODEL,
@@ -46,6 +46,7 @@ from .const import (
     DEFAULT_SLAVE,
     DEVICE_INFO_BLOCK,
     DOMAIN,
+    FEATURE_SOC_HYSTERESIS,
     FIRMWARE_VERSION,
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_LAPSE_S,
@@ -66,12 +67,15 @@ from .const import (
 )
 from .energy_processor import EnergyProcessor
 from .models import (
-    ControlIntent,
+    ControlFeature,
     ControlMode,
     CoordinatorStatus,
+    FeatureState,
     InverterModel,
     NumberWritableDef,
     RegisterType,
+    SocCondition,
+    deviation_state,
     encode_register,
 )
 from .telemetry import (
@@ -155,8 +159,23 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         # A restart stops the heartbeat, so the device has already handed control back
         # to the app by the time we get here: automatic is the truth, not a guess.
-        self._control_intent = ControlIntent.AUTOMATIC
-        self._control_power = 0.0
+        # The parameters are restored from disk, the arm deliberately is not.
+        self._feature = ControlFeature.AUTOMATIC
+        self._feature_power: dict[ControlFeature, float] = {
+            feature: definition.default_power
+            for feature, definition in CONTROL_FEATURES.items()
+            if definition.has_power
+        }
+        self._feature_target_soc: dict[ControlFeature, float] = {
+            feature: definition.default_target_soc
+            for feature, definition in CONTROL_FEATURES.items()
+            if definition.has_target_soc
+        }
+        # Latched so the feature does not chatter on a SOC sitting at its target.
+        self._target_soc_reached = False
+
+        self._commanded_feature = ControlFeature.AUTOMATIC
+        self._commanded_power = 0.0
         self._power_saving = False
         self._last_control_write_time: datetime | None = None
         # Set when control authority may have lapsed; the next poll re-sends the word.
@@ -197,43 +216,74 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         return self._last_heartbeat_time
 
     @property
-    def control_intent(self) -> ControlIntent:
-        """Return the intent the user has commanded."""
-        return self._control_intent
+    def selected_feature(self) -> ControlFeature:
+        """Return the feature the user switched on, driving or merely waiting."""
+        return self._feature
+
+    @property
+    def active_feature(self) -> ControlFeature | None:
+        """Return the feature actually moving power, if any."""
+        if self._feature is ControlFeature.AUTOMATIC or not self._heartbeat_enabled:
+            return None
+        return None if self._target_soc_reached else self._feature
 
     @property
     def control_method(self) -> ControlMode:
-        """Return the protocol control method the current intent maps to."""
-        return CONTROL_INTENTS[self._control_intent].method
+        """Return the protocol control method currently being commanded."""
+        return CONTROL_FEATURES[self._commanded_feature].method
 
     @property
     def control_power(self) -> float:
-        """Return the commanded power magnitude for the current intent."""
-        return self._control_power
+        """Return the power magnitude currently being commanded."""
+        return self._commanded_power
 
-    @property
-    def control_power_max(self) -> float:
-        """Return the ceiling for the current intent, from the device where it knows one."""
-        return self._control_power_ceiling(self._control_intent)
+    def feature_power(self, feature: ControlFeature) -> float:
+        """Return the configured power, or zero for a feature that has none."""
+        return self._feature_power.get(feature, 0.0)
 
-    def _control_power_ceiling(self, intent: ControlIntent) -> float:
-        """Return the lowest ceiling that applies to *intent*.
+    def feature_power_max(self, feature: ControlFeature) -> float:
+        return self._control_power_ceiling(feature)
 
-        Nothing can exceed the inverter's AC rating whatever the mode asks for, and
-        the device's own per-mode limit caps it further where one is published.
+    def feature_target_soc(self, feature: ControlFeature) -> float:
+        return self._feature_target_soc.get(feature, 100.0)
+
+    def feature_state(self, feature: ControlFeature) -> FeatureState:
+        """Explain, in one word, why this feature is or is not moving power."""
+        if feature is not self._feature:
+            return FeatureState.OFF
+        if not self._heartbeat_enabled:
+            return FeatureState.NO_MODBUS_CONTROL
+        if self._target_soc_reached:
+            return FeatureState.WAITING_FOR_SOC
+
+        data = self.data or {}
+        definition = CONTROL_FEATURES[feature]
+        measured = (
+            data.get(definition.measure_key)
+            if definition.measure_key is not None
+            else None
+        )
+        return deviation_state(
+            signed_target=self._commanded_power * definition.sign,
+            measured=None if measured is None else float(measured),
+            soc=None if (soc := data.get("battery_soc")) is None else float(soc),
+            min_soc=float(data.get("min_soc_limit") or 0.0),
+        )
+
+    def _control_power_ceiling(self, feature: ControlFeature) -> float:
+        """Return the lowest ceiling that applies to *feature*.
+
+        Nothing can exceed the inverter's AC rating whatever the feature asks for,
+        and the device's own limit caps it further where one is published.
         """
         data = self.data or {}
-        definition = CONTROL_INTENTS[intent]
+        definition = CONTROL_FEATURES[feature]
         ceilings = [float(CONTROL_POWER_FALLBACK_MAX)]
 
         if definition.limit_key is not None and (
             limit := data.get(definition.limit_key)
         ):
             ceilings.append(float(limit))
-        if intent is ControlIntent.IMPORT_FROM_GRID:
-            ceilings.append(
-                float(self.limits.get(CONF_MAX_GRID_POWER, CONTROL_POWER_FALLBACK_MAX))
-            )
         if rated := data.get("inverter_rated_power"):
             ceilings.append(float(rated))
 
@@ -295,6 +345,12 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             "last_checked_time": self._last_checked_time.isoformat()
             if self._last_checked_time is not None
             else None,
+            "feature_power": {
+                str(feature): power for feature, power in self._feature_power.items()
+            },
+            "feature_target_soc": {
+                str(feature): soc for feature, soc in self._feature_target_soc.items()
+            },
             **self._energy_processor.dump_state(),
         }
 
@@ -305,7 +361,21 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         self._last_checked_data = stored.get("last_checked_data") or {}
         self._last_checked_time = parse_datetime(stored.get("last_checked_time"))
+        self._restore_feature_parameters(stored)
         self._energy_processor.load_state(stored)
+
+    def _restore_feature_parameters(self, stored: dict[str, Any]) -> None:
+        """Restore what each feature would command, but never that it was on."""
+        for feature in self._feature_power:
+            if (
+                power := (stored.get("feature_power") or {}).get(str(feature))
+            ) is not None:
+                self._feature_power[feature] = float(power)
+        for feature in self._feature_target_soc:
+            if (
+                soc := (stored.get("feature_target_soc") or {}).get(str(feature))
+            ) is not None:
+                self._feature_target_soc[feature] = float(soc)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -507,106 +577,124 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             word |= 1 << CONTROL_COMMAND_POWER_SAVING_BIT
         return word
 
-    def _seed_control_power(self, intent: ControlIntent) -> float:
-        """Return a starting power that makes engaging *intent* a no-op.
+    def _clamp_power(self, watts: float, feature: ControlFeature) -> float:
+        """Clamp a magnitude to zero and the device's own ceiling for *feature*."""
+        return max(0.0, min(float(watts), self._control_power_ceiling(feature)))
 
-        Entering a mode with whatever the setpoint register happens to hold would
-        apply a stale command from a previous session, so the intent starts by
-        telling the device to keep doing what it is already doing.
+    # ── Features ──────────────────────────────────────────────────────────────
+
+    async def async_select_feature(self, feature: ControlFeature) -> None:
+        """Switch a feature on, replacing whatever was on before.
+
+        Switching one on does not necessarily command anything: a feature whose SOC
+        target is already met waits, armed, until the state of charge moves back.
         """
-        definition = CONTROL_INTENTS[intent]
-        if definition.seed_key is None:
-            return 0.0
-        measured = (self.data or {}).get(definition.seed_key)
-        if measured is None:
-            raise HomeAssistantError(
-                f"Cannot switch to {intent}: {definition.seed_key} has not been read "
-                "yet, so there is no safe starting point for the setpoint."
-            )
-        return self._clamp_control_power(float(measured) * definition.sign, intent)
+        if feature is not ControlFeature.AUTOMATIC:
+            self._require_modbus_control()
 
-    def _clamp_control_power(self, watts: float, intent: ControlIntent) -> float:
-        """Clamp a magnitude to zero and the device's own ceiling for *intent*."""
-        return max(0.0, min(float(watts), self._control_power_ceiling(intent)))
+        self._feature = feature
+        self._target_soc_reached = False
+        await self.async_apply_feature()
 
-    async def async_set_control_intent(self, intent: ControlIntent) -> None:
-        """Command an intent, seeding its setpoint so the change itself does nothing."""
-        definition = CONTROL_INTENTS[intent]
-        if not definition.controls_power:
-            await self._async_stop_commanding(intent)
+    async def async_set_feature_power(
+        self, feature: ControlFeature, watts: float
+    ) -> None:
+        """Set a feature's power. Editable whether or not the feature is switched on."""
+        self._feature_power[feature] = self._clamp_power(watts, feature)
+        await self.async_apply_feature()
+
+    async def async_set_feature_target_soc(
+        self, feature: ControlFeature, soc: float
+    ) -> None:
+        """Set the SOC at which a feature stops asking for power."""
+        self._feature_target_soc[feature] = max(0.0, min(100.0, soc))
+        self._target_soc_reached = False
+        await self.async_apply_feature()
+
+    def _update_target_soc_reached(self, data: dict[str, Any]) -> None:
+        """Latch whether the selected feature has met its SOC target."""
+        definition = CONTROL_FEATURES[self._feature]
+        if not definition.has_target_soc:
+            self._target_soc_reached = False
             return
 
-        self._require_modbus_control()
-        if not self.connected:
-            raise HomeAssistantError("Modbus client is not connected")
+        soc = data.get("battery_soc")
+        if soc is None:
+            return
 
-        seeded = self._seed_control_power(intent)
-        previous_intent = self._control_intent
-        previous_power = self._control_power
-        self._control_intent = intent
-        self._control_power = seeded
+        soc = float(soc)
+        target = self._feature_target_soc[self._feature]
+        if definition.soc_condition is SocCondition.STOP_AT_OR_ABOVE:
+            reached, released = soc >= target, soc <= target - FEATURE_SOC_HYSTERESIS
+        else:
+            reached, released = soc <= target, soc >= target + FEATURE_SOC_HYSTERESIS
 
-        try:
-            await self._async_require_control_authority()
-            await self._async_write_setpoint(intent, seeded)
-            await self._async_apply_control_command()
-        except HomeAssistantError:
-            self._control_intent = previous_intent
-            self._control_power = previous_power
-            raise
+        if reached:
+            self._target_soc_reached = True
+        elif released:
+            self._target_soc_reached = False
 
-        self.async_update_listeners()
+    def _desired_command(self) -> tuple[ControlFeature, float]:
+        """Return what the device should be told right now.
 
-    async def _async_stop_commanding(self, intent: ControlIntent) -> None:
-        """Return to automatic. Never raises.
-
-        The clearing write is best effort: if it does not get through, the device
-        falls back to the app by itself once the heartbeat stops. Modbus control
-        itself is left as the user set it.
+        A feature that has met its target keeps its control method with a setpoint
+        of zero rather than releasing it: dropping back to the default method would
+        let the inverter resume self-consumption and lose the arm.
         """
-        already_idle = self._control_intent is intent
-        self._control_intent = intent
-        self._control_power = 0.0
+        if not self._heartbeat_enabled or self._feature is ControlFeature.AUTOMATIC:
+            return ControlFeature.AUTOMATIC, 0.0
+        if self._target_soc_reached:
+            return self._feature, 0.0
+        return self._feature, self._clamp_power(
+            self.feature_power(self._feature), self._feature
+        )
 
-        if not already_idle and self.connected and self._heartbeat_enabled:
-            try:
-                await self._async_write_control_word(self._compose_control_command())
-            except HomeAssistantError as err:
-                _LOGGER.warning(
-                    "Could not clear the control word (%s); the device hands control "
-                    "back on its own within %ss",
-                    err,
-                    HEARTBEAT_LAPSE_S,
-                )
+    async def async_apply_feature(
+        self, data: dict[str, Any] | None = None, *, notify: bool = True
+    ) -> None:
+        """Send what the selected feature asks for, if it differs from the last send."""
+        self._update_target_soc_reached(data if data is not None else self.data or {})
 
-        self.async_update_listeners()
+        feature, power = self._desired_command()
+        changed = (feature, round(power)) != (
+            self._commanded_feature,
+            round(self._commanded_power),
+        )
+        self._commanded_feature = feature
+        self._commanded_power = power
 
-    async def async_set_control_power(self, watts: float) -> None:
-        """Change the magnitude for the active intent. Automatic has nothing to set."""
-        definition = CONTROL_INTENTS[self._control_intent]
-        if not definition.controls_power:
-            raise HomeAssistantError(
-                "Select a control mode other than automatic before setting a power"
-            )
-        self._require_modbus_control()
+        try:
+            if changed or self._control_stale:
+                await self._async_send_control(feature, power)
+        finally:
+            if notify:
+                self.async_update_listeners()
+
+    async def _async_send_control(self, feature: ControlFeature, power: float) -> None:
+        """Write the setpoint and then the control word that selects its method."""
         if not self.connected:
             raise HomeAssistantError("Modbus client is not connected")
 
-        clamped = self._clamp_control_power(watts, self._control_intent)
-        previous = self._control_power
-        self._control_power = clamped
-        try:
+        if CONTROL_FEATURES[feature].commands_power:
             await self._async_require_control_authority()
-            await self._async_write_setpoint(self._control_intent, clamped)
-        except HomeAssistantError:
-            self._control_power = previous
-            raise
+            await self._async_write_setpoint(feature, power)
 
-        self.async_update_listeners()
+        await self._async_write_control_word(self._compose_control_command())
+        self._last_control_write_time = dt.now()
+        self._control_stale = False
 
-    async def _async_write_setpoint(self, intent: ControlIntent, watts: float) -> None:
-        """Write the register the intent's method acts on, with the intent's sign."""
-        definition = CONTROL_INTENTS[intent]
+    async def _async_apply_feature_safe(self, data: dict[str, Any]) -> None:
+        """Run from a poll, where a write failure must not stop the read."""
+        try:
+            await self.async_apply_feature(data, notify=False)
+        except HomeAssistantError as err:
+            _LOGGER.debug(f"Could not apply {self._feature} this poll: {err!r}")
+
+    async def _async_write_setpoint(
+        self, feature: ControlFeature, watts: float
+    ) -> None:
+        """Write the register the feature's method acts on, with the feature's sign."""
+        definition = CONTROL_FEATURES[feature]
         if definition.setpoint_key is None:
             return
         try:
@@ -671,7 +759,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         # Power saving applies on its own, like the LED brightness does. Only a
         # control method needs the app locked out, so only it takes control.
-        if CONTROL_INTENTS[self._control_intent].controls_power:
+        if CONTROL_FEATURES[self._commanded_feature].commands_power:
             await self._async_require_control_authority()
 
         await self._async_write_control_word(value)
@@ -704,40 +792,6 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError(
                 f"Modbus rejected control command 0x{value:08X}: {response}"
             )
-
-    async def _async_reconcile_control_command(self, data: dict[str, Any]) -> None:
-        """Re-send the command after a control-authority lapse, and only then.
-
-        Losing the heartbeat window makes the device fall back to the app settings,
-        so both the setpoint and the control word have to go out again. There is no
-        read-back to compare against: System State 2 is not implemented on every
-        model, so a poll never second-guesses what was commanded.
-        """
-        if not self._heartbeat_enabled or self._heartbeat_supported is False:
-            return
-        if not self._control_stale:
-            return
-
-        definition = CONTROL_INTENTS[self._control_intent]
-        if not definition.controls_power:
-            self._control_stale = False
-            return
-
-        word = self._compose_control_command()
-        _LOGGER.info(
-            "Re-sending control word 0x%08X after a control-authority lapse", word
-        )
-        try:
-            if definition.controls_power:
-                await self._async_write_setpoint(
-                    self._control_intent, self._control_power
-                )
-            await self._async_write_control_word(word)
-        except HomeAssistantError as err:
-            _LOGGER.debug(f"Control command re-send failed: {err!r}")
-            return
-        self._last_control_write_time = dt.now()
-        self._control_stale = False
 
     def _log_state_word_changes(self, data: dict[str, Any]) -> None:
         """Trace the raw status words, so any reaction to a command is visible."""
@@ -793,7 +847,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
                 data["battery_count"] = configured_battery_count
 
-            await self._async_reconcile_control_command(data)
+            await self._async_apply_feature_safe(data)
             return data
         except ModbusException as err:
             _LOGGER.debug(f"{err.string}. Connection closing...")

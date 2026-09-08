@@ -7,14 +7,14 @@ from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONTROL_POWER_NUMBER, DOMAIN, WRITABLE_NUMBERS_MAP
+from .const import CONTROL_FEATURES, DOMAIN, UNIT_OF_RATIO, WRITABLE_NUMBERS_MAP
 from .coordinator import EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
-from .models import ControlIntent, ControlPowerDef, NumberWritableDef
+from .models import ControlFeature, FeatureEntityDef, NumberWritableDef
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,9 +30,25 @@ async def async_setup_entry(
     """Automatically set up number entities from the WRITABLE_NUMBERS_MAP configuration list."""
     coordinator: EcoflowCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[NumberEntity] = [
-        EcoFlowControlPowerNumber(coordinator, entry, CONTROL_POWER_NUMBER)
-    ]
+    entities: list[NumberEntity] = []
+    for feature, definition in CONTROL_FEATURES.items():
+        if definition.has_power:
+            entities.append(
+                EcoFlowFeaturePowerNumber(
+                    coordinator,
+                    entry,
+                    FeatureEntityDef(key=f"{feature}_power", feature=feature),
+                )
+            )
+        if definition.has_target_soc:
+            entities.append(
+                EcoFlowFeatureTargetSocNumber(
+                    coordinator,
+                    entry,
+                    FeatureEntityDef(key=f"{feature}_target_soc", feature=feature),
+                )
+            )
+
     entities.extend(
         EcoFlowGenericNumber(coordinator, entry, number_def)
         for number_def in WRITABLE_NUMBERS_MAP
@@ -41,59 +57,69 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class EcoFlowControlPowerNumber(EcoFlowBaseEntity, NumberEntity):
-    """The single power target for whichever control mode is selected.
+class EcoFlowFeatureNumber(EcoFlowBaseEntity, NumberEntity):
+    """A parameter of one feature.
 
-    There is one of these rather than one per setpoint register, so a value can
-    never be written to a register the active control method is ignoring. The
-    ceiling follows the mode and comes from the device's own limits.
+    Always editable, whether or not its feature is switched on, so a command can be
+    set up long before the conditions for it arrive. Only the selected feature's
+    values ever reach the wire.
     """
 
-    _attr_native_min_value = 0.0
     _attr_mode = NumberMode.SLIDER
+    _attr_native_min_value = 0.0
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(
         self,
         coordinator: EcoflowCoordinator,
         entry: ConfigEntry,
-        definition: ControlPowerDef,
+        definition: FeatureEntityDef,
     ) -> None:
         super().__init__(coordinator, entry, definition)
-        self._attr_native_step = definition.step
-        self._attr_native_unit_of_measurement = definition.unit
-        self._attr_device_class = definition.device_class
-        self._attr_entity_category = definition.entity_category
-        if definition.icon:
-            self._attr_icon = definition.icon
-
-    @property
-    def available(self) -> bool:
-        # Nothing to target unless Modbus control is held and a mode is selected.
-        return (
-            super().available
-            and self.coordinator.heartbeat_enabled
-            and self.coordinator.control_intent is not ControlIntent.AUTOMATIC
-        )
-
-    @property
-    def native_max_value(self) -> float:
-        return self.coordinator.control_power_max
-
-    @property
-    def native_value(self) -> float:
-        # The ceiling is read live, so it can drop below what was commanded.
-        return min(self.coordinator.control_power, self.coordinator.control_power_max)
+        self._feature: ControlFeature = definition.feature
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "control_mode": str(self.coordinator.control_intent),
-            # The device slews at roughly 1.5 kW/min, so measured power lags this.
-            "in_control": self.coordinator.in_control,
-        }
+        return {"state": str(self.coordinator.feature_state(self._feature))}
+
+
+class EcoFlowFeaturePowerNumber(EcoFlowFeatureNumber):
+    """How much power the feature asks for while it is running."""
+
+    _attr_native_step = 100.0
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = "power"
+    _attr_icon = "mdi:speedometer"
+
+    @property
+    def native_max_value(self) -> float:
+        # The device publishes its own ceiling, and it moves with the battery, so
+        # the slider follows it rather than a configured guess.
+        return self.coordinator.feature_power_max(self._feature)
+
+    @property
+    def native_value(self) -> float:
+        return min(self.coordinator.feature_power(self._feature), self.native_max_value)
 
     async def async_set_native_value(self, value: float) -> None:
-        await self.coordinator.async_set_control_power(value)
+        await self.coordinator.async_set_feature_power(self._feature, value)
+
+
+class EcoFlowFeatureTargetSocNumber(EcoFlowFeatureNumber):
+    """The state of charge at which the feature stops asking for power."""
+
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = UNIT_OF_RATIO
+    _attr_device_class = "battery"
+    _attr_icon = "mdi:battery-check"
+
+    @property
+    def native_value(self) -> float:
+        return self.coordinator.feature_target_soc(self._feature)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_set_feature_target_soc(self._feature, value)
 
 
 class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):

@@ -16,10 +16,9 @@ from homeassistant.const import (
 
 from .models import (
     BinarySensorDef,
-    ControlIntent,
-    ControlIntentDef,
+    ControlFeature,
+    ControlFeatureDef,
     ControlMode,
-    ControlPowerDef,
     CoordinatorStatus,
     EnergySensorDef,
     GridMode,
@@ -29,8 +28,8 @@ from .models import (
     RegisterBlock,
     RegisterDef,
     RegisterType,
-    SelectDef,
     SensorDef,
+    SocCondition,
     SwitchDef,
     plan_blocks_for_model,
 )
@@ -642,68 +641,64 @@ POWER_SAVING_SWITCH: Final = SwitchDef(
     icon="mdi:leaf",
 )
 
-# What each intent means on the wire. The sign lives here rather than in the user's
-# value, so the power entity is always a positive magnitude.
-CONTROL_INTENTS: Final[dict[ControlIntent, ControlIntentDef]] = {
-    ControlIntent.AUTOMATIC: ControlIntentDef(method=ControlMode.DEFAULT),
-    ControlIntent.CHARGE_BATTERY: ControlIntentDef(
+# Everything the user can ask for, and what it means on the wire. The protocol
+# follows one control method at a time, so exactly one of these is ever in force.
+CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
+    ControlFeature.AUTOMATIC: ControlFeatureDef(method=ControlMode.DEFAULT),
+    ControlFeature.HOLD_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        measure_key="battery_power",
+        icon="mdi:battery-lock",
+    ),
+    ControlFeature.CHARGE_BATTERY: ControlFeatureDef(
         method=ControlMode.BATTERY_LIMITS,
         setpoint_key="battery_power_setpoint",
         sign=1,
-        seed_key="battery_power",
+        measure_key="battery_power",
         limit_key="battery_charge_power_limit",
+        default_power=2000.0,
+        soc_condition=SocCondition.STOP_AT_OR_ABOVE,
+        default_target_soc=100.0,
+        icon="mdi:battery-charging",
     ),
-    ControlIntent.DISCHARGE_BATTERY: ControlIntentDef(
+    ControlFeature.DISCHARGE_BATTERY: ControlFeatureDef(
         method=ControlMode.BATTERY_LIMITS,
         setpoint_key="battery_power_setpoint",
         sign=-1,
-        seed_key="battery_power",
+        measure_key="battery_power",
         limit_key="battery_discharge_power_limit",
+        default_power=2000.0,
+        soc_condition=SocCondition.STOP_AT_OR_BELOW,
+        default_target_soc=20.0,
+        icon="mdi:battery-arrow-down",
     ),
-    ControlIntent.IMPORT_FROM_GRID: ControlIntentDef(
-        method=ControlMode.SYSTEM_FEED,
-        setpoint_key="system_power_setpoint",
-        sign=1,
-        seed_key="grid_power",
-    ),
-    ControlIntent.EXPORT_TO_GRID: ControlIntentDef(
+    ControlFeature.EXPORT_TO_GRID: ControlFeatureDef(
         method=ControlMode.SYSTEM_FEED,
         setpoint_key="system_power_setpoint",
         sign=-1,
-        seed_key="grid_power",
+        measure_key="grid_power",
         limit_key="feed_in_power_max",
-    ),
-    ControlIntent.LIMIT_INVERTER_OUTPUT: ControlIntentDef(
-        method=ControlMode.INVERTER_FEED,
-        setpoint_key="inverter_power_setpoint",
-        sign=1,
-        # The inverter's AC output is not a register: house power less grid power.
-        seed_key="inverter_output_power",
-        limit_key="inverter_rated_power",
+        default_power=3000.0,
+        soc_condition=SocCondition.STOP_AT_OR_BELOW,
+        default_target_soc=20.0,
+        icon="mdi:transmission-tower-export",
     ),
 }
 
-CONTROL_INTENT_SELECT: Final = SelectDef(
-    key="control_mode_control",
-    options=tuple(ControlIntent),
-    entity_category=EntityCategory.CONFIG,
-    icon="mdi:remote",
+# Re-engaging at exactly the target would chatter on a SOC sitting on the boundary.
+FEATURE_SOC_HYSTERESIS: Final = 2.0
+
+# Not a device register: what the inverter is being told to do, and why nothing is
+# happening when it looks like it should be.
+ACTIVE_CONTROL_SENSOR: Final = SensorDef(
+    key="active_control",
+    device_class="enum",
+    options=("off", *(str(feature) for feature in ControlFeature)),
+    icon="mdi:robot",
 )
 
-# One number for every intent. Its meaning and ceiling follow the selected intent,
-# and it is unavailable while the inverter is running itself. The step is coarse
-# enough to drag across a whole inverter's range; the device slews far slower than
-# 100 W of precision would buy.
-CONTROL_POWER_NUMBER: Final = ControlPowerDef(
-    key="control_power_control",
-    step=100.0,
-    unit=UnitOfPower.WATT,
-    device_class="power",
-    entity_category=EntityCategory.CONFIG,
-    icon="mdi:speedometer",
-)
-
-# Ceiling for an intent whose limit registers are all missing or read zero.
+# Ceiling for a feature whose limit registers are all missing or read zero.
 CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
 
 

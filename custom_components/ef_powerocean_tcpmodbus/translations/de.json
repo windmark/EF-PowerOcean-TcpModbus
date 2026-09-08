@@ -350,6 +350,17 @@
       },
       "inverter_output_power": {
         "name": "Wechselrichter-Ausgangsleistung"
+      },
+      "active_control": {
+        "name": "Aktive Steuerung",
+        "state": {
+          "off": "Modbus-Steuerung aus",
+          "automatic": "Automatisch",
+          "hold_battery": "Batterie halten",
+          "charge_battery": "Batterie laden",
+          "discharge_battery": "Batterie entladen",
+          "export_to_grid": "Ins Netz einspeisen"
+        }
       }
     },
     "binary_sensor": {
@@ -381,8 +392,23 @@
       }
     },
     "number": {
-      "control_power_control": {
-        "name": "Steuerungsleistung"
+      "charge_battery_power": {
+        "name": "Ladeleistung"
+      },
+      "charge_battery_target_soc": {
+        "name": "Laden bis Ladezustand"
+      },
+      "discharge_battery_power": {
+        "name": "Entladeleistung"
+      },
+      "discharge_battery_target_soc": {
+        "name": "Entladen bis Ladezustand"
+      },
+      "export_to_grid_power": {
+        "name": "Einspeiseleistung"
+      },
+      "export_to_grid_target_soc": {
+        "name": "Einspeisen bis Ladezustand"
       },
       "min_soc_limit_control": {
         "name": "Batterie Backup-Reserve Steuerung"
@@ -391,20 +417,19 @@
         "name": "Helligkeit LED-Geräteanzeige Steuerung"
       }
     },
-    "select": {
-      "control_mode_control": {
-        "name": "Steuerungsmodus",
-        "state": {
-          "automatic": "Automatisch",
-          "charge_battery": "Batterie laden mit",
-          "discharge_battery": "Batterie entladen mit",
-          "import_from_grid": "Netzbezug von",
-          "export_to_grid": "Netzeinspeisung von",
-          "limit_inverter_output": "Wechselrichterleistung begrenzen auf"
-        }
-      }
-    },
     "switch": {
+      "hold_battery": {
+        "name": "Batterie halten"
+      },
+      "charge_battery": {
+        "name": "Batterie laden"
+      },
+      "discharge_battery": {
+        "name": "Batterie entladen"
+      },
+      "export_to_grid": {
+        "name": "Ins Netz einspeisen"
+      },
       "battery_saver_mode_control": {
         "name": "Batteriesparmodus Steuerung"
       }

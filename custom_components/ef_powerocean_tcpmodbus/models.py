@@ -131,39 +131,126 @@ class ControlMode(StrEnum):
         return tuple(mode for mode in cls if mode.command_value is not None)
 
 
-class ControlIntent(StrEnum):
-    """What the user wants the inverter to do, in their terms rather than the protocol's.
+class ControlFeature(StrEnum):
+    """What the user wants the inverter to do, one at a time.
 
-    Each intent pins a control method and the sign of its setpoint, so the power
-    entity is always a positive magnitude and no combination of the two can be wrong.
+    The protocol follows a single control method, so these are exclusive by nature
+    rather than by policy. Their parameters are not: those live on separately and
+    can be set up long before the feature they belong to is switched on.
     """
 
     AUTOMATIC = "automatic"
+    HOLD_BATTERY = "hold_battery"
     CHARGE_BATTERY = "charge_battery"
     DISCHARGE_BATTERY = "discharge_battery"
-    IMPORT_FROM_GRID = "import_from_grid"
     EXPORT_TO_GRID = "export_to_grid"
-    LIMIT_INVERTER_OUTPUT = "limit_inverter_output"
+
+
+class SocCondition(StrEnum):
+    """When a feature stops asking for power, turning a command into a policy."""
+
+    NONE = "none"
+    STOP_AT_OR_ABOVE = "stop_at_or_above"
+    STOP_AT_OR_BELOW = "stop_at_or_below"
+
+
+class FeatureState(StrEnum):
+    """Why a feature is or is not moving any power right now."""
+
+    OFF = "off"
+    ACTIVE = "active"
+    RAMPING = "ramping"
+    WAITING_FOR_SOC = "waiting_for_soc"
+    UNREACHABLE_BATTERY_FULL = "unreachable_battery_full"
+    UNREACHABLE_BATTERY_EMPTY = "unreachable_battery_empty"
+    NO_MODBUS_CONTROL = "no_modbus_control"
 
 
 @dataclass(frozen=True)
-class ControlIntentDef:
-    """How an intent maps onto the protocol, and how to bound and seed its power."""
+class ControlFeatureDef:
+    """A feature, the instruction it sends, and the condition that ends it.
+
+    The sign lives here rather than in the user's value, so every power shown and
+    set is a positive magnitude and no combination of the two can be wrong.
+    """
 
     method: ControlMode
     # Read key of the setpoint register the method acts on; None for AUTOMATIC.
     setpoint_key: str | None = None
-    # Applied to the user's positive magnitude to get the value the device wants.
     sign: int = 1
-    # Telemetry key whose present value seeds the power when the intent is engaged,
-    # so switching mode never applies a stale setpoint from a previous session.
-    seed_key: str | None = None
-    # Telemetry key holding the device's own ceiling for this intent, if it has one.
+    # Telemetry key holding the quantity this feature pins, in the setpoint's sign
+    # convention. Comparing it against the command is the only way to tell "it is
+    # working" from "the battery has no headroom left".
+    measure_key: str | None = None
+    # Telemetry key holding the device's own ceiling for this feature, if it has one.
     limit_key: str | None = None
+    # None for a feature with no power to configure, which commands zero.
+    default_power: float | None = None
+    soc_condition: SocCondition = SocCondition.NONE
+    default_target_soc: float = 100.0
+    icon: str | None = None
 
     @property
-    def controls_power(self) -> bool:
+    def commands_power(self) -> bool:
         return self.setpoint_key is not None
+
+    @property
+    def has_power(self) -> bool:
+        return self.default_power is not None
+
+    @property
+    def has_target_soc(self) -> bool:
+        return self.soc_condition is not SocCondition.NONE
+
+
+@dataclass(frozen=True)
+class FeatureEntityDef:
+    """A switch or number belonging to a feature."""
+
+    key: str
+    feature: ControlFeature
+    icon: str | None = None
+    entity_category: EntityCategory | None = None
+
+
+# A commanded setpoint is never met exactly: the device slews at roughly 1.5 kW/min
+# and settles with a standing offset, so only a wide miss means anything.
+POWER_TOLERANCE_W: Final = 250.0
+POWER_TOLERANCE_FRACTION: Final = 0.05
+# SOC readings are whole percent, so leave room rather than testing for exactly 100.
+BATTERY_FULL_SOC: Final = 99.0
+BATTERY_EMPTY_MARGIN_SOC: Final = 1.0
+
+
+def deviation_state(
+    *,
+    signed_target: float,
+    measured: float | None,
+    soc: float | None,
+    min_soc: float,
+) -> FeatureState:
+    """Judge a setpoint that is already commanded against what the system is doing.
+
+    Every control method reaches its target by moving the battery, and the device
+    will not curtail PV to help, so a target is only reachable while the battery
+    has headroom in the direction the error points. A positive error needs the
+    battery to absorb, a negative one needs it to supply.
+    """
+    if measured is None:
+        return FeatureState.ACTIVE
+
+    error = signed_target - measured
+    tolerance = max(POWER_TOLERANCE_W, abs(signed_target) * POWER_TOLERANCE_FRACTION)
+    if abs(error) <= tolerance:
+        return FeatureState.ACTIVE
+
+    if soc is not None:
+        if error > 0 and soc >= BATTERY_FULL_SOC:
+            return FeatureState.UNREACHABLE_BATTERY_FULL
+        if error < 0 and soc <= min_soc + BATTERY_EMPTY_MARGIN_SOC:
+            return FeatureState.UNREACHABLE_BATTERY_EMPTY
+
+    return FeatureState.RAMPING
 
 
 class RegisterType(StrEnum):
@@ -343,28 +430,6 @@ class BinarySensorDef:
 @dataclass(frozen=True)
 class SwitchDef:
     key: str
-    name: str | None = None
-    device_class: str | None = None
-    entity_category: EntityCategory | None = None
-    icon: str | None = None
-
-
-@dataclass(frozen=True)
-class SelectDef:
-    key: str
-    options: tuple[str, ...]
-    name: str | None = None
-    entity_category: EntityCategory | None = None
-    icon: str | None = None
-
-
-@dataclass(frozen=True)
-class ControlPowerDef:
-    """The single power entity whose meaning follows the selected control intent."""
-
-    key: str
-    step: float
-    unit: str
     name: str | None = None
     device_class: str | None = None
     entity_category: EntityCategory | None = None
