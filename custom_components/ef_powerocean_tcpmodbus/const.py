@@ -375,27 +375,6 @@ SENSOR_MAP: list[SensorDef] = [
         state_class="measurement",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
-    SensorDef(
-        key="soc_battery_1",
-        unit=UNIT_OF_RATIO,
-        device_class="battery",
-        state_class="measurement",
-        entity_category=EntityCategory.DIAGNOSTIC,
-    ),
-    SensorDef(
-        key="soc_battery_2",
-        unit=UNIT_OF_RATIO,
-        device_class="battery",
-        state_class="measurement",
-        entity_category=EntityCategory.DIAGNOSTIC,
-    ),
-    SensorDef(
-        key="soc_battery_3",
-        unit=UNIT_OF_RATIO,
-        device_class="battery",
-        state_class="measurement",
-        entity_category=EntityCategory.DIAGNOSTIC,
-    ),
     *[
         SensorDef(
             key=key,
