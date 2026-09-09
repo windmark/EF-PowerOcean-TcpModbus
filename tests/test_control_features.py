@@ -8,8 +8,7 @@ from ef_powerocean_tcpmodbus.models import (
     BATTERY_FULL_SOC,
     ControlFeature,
     ControlMode,
-    FeatureState,
-    SocCondition,
+    ControlStatus,
     deviation_state,
 )
 from ef_powerocean_tcpmodbus.telemetry import TelemetryData, calculate_derived_values
@@ -74,19 +73,22 @@ def test_holding_the_battery_commands_a_method_but_no_power() -> None:
 
     assert definition.commands_power
     assert not definition.has_power
-    assert not definition.has_target_soc
 
 
-def test_charge_stops_going_up_and_discharge_stops_going_down() -> None:
-    conditions = {
-        feature: definition.soc_condition
-        for feature, definition in const.CONTROL_FEATURES.items()
-    }
+def test_the_sign_decides_which_soc_limit_ends_a_mode() -> None:
+    """Charging stops at the ceiling, discharging and exporting at the floor."""
+    features = const.CONTROL_FEATURES
 
-    assert conditions[ControlFeature.CHARGE_BATTERY] is SocCondition.STOP_AT_OR_ABOVE
-    assert conditions[ControlFeature.DISCHARGE_BATTERY] is SocCondition.STOP_AT_OR_BELOW
-    assert conditions[ControlFeature.EXPORT_TO_GRID] is SocCondition.STOP_AT_OR_BELOW
-    assert conditions[ControlFeature.AUTOMATIC] is SocCondition.NONE
+    assert features[ControlFeature.CHARGE_BATTERY].stops_when_charged
+    assert not features[ControlFeature.DISCHARGE_BATTERY].stops_when_charged
+    assert not features[ControlFeature.EXPORT_TO_GRID].stops_when_charged
+
+
+def test_the_select_offers_every_mode() -> None:
+    assert const.BATTERY_MODE_SELECT.key == "battery_mode"
+    assert const.CONTROL_STATUS_SENSOR.options == tuple(
+        str(status) for status in ControlStatus
+    )
 
 
 def test_a_setpoint_that_is_being_met_reads_as_active() -> None:
@@ -94,7 +96,7 @@ def test_a_setpoint_that_is_being_met_reads_as_active() -> None:
         signed_target=3000.0, measured=2900.0, soc=50.0, min_soc=10.0
     )
 
-    assert state is FeatureState.ACTIVE
+    assert state is ControlStatus.ACTIVE
 
 
 def test_a_full_battery_explains_a_target_that_needs_absorbing() -> None:
@@ -103,7 +105,7 @@ def test_a_full_battery_explains_a_target_that_needs_absorbing() -> None:
         signed_target=-1000.0, measured=-6400.0, soc=100.0, min_soc=10.0
     )
 
-    assert state is FeatureState.UNREACHABLE_BATTERY_FULL
+    assert state is ControlStatus.UNREACHABLE_BATTERY_FULL
 
 
 def test_an_empty_battery_explains_a_target_that_needs_supplying() -> None:
@@ -111,7 +113,7 @@ def test_an_empty_battery_explains_a_target_that_needs_supplying() -> None:
         signed_target=-7000.0, measured=-2000.0, soc=10.0, min_soc=10.0
     )
 
-    assert state is FeatureState.UNREACHABLE_BATTERY_EMPTY
+    assert state is ControlStatus.UNREACHABLE_BATTERY_EMPTY
 
 
 def test_a_wide_miss_with_headroom_left_is_only_ramping() -> None:
@@ -120,7 +122,7 @@ def test_a_wide_miss_with_headroom_left_is_only_ramping() -> None:
         signed_target=5000.0, measured=1000.0, soc=50.0, min_soc=10.0
     )
 
-    assert state is FeatureState.RAMPING
+    assert state is ControlStatus.RAMPING
 
 
 def test_full_is_judged_below_a_hundred_percent() -> None:
@@ -129,4 +131,4 @@ def test_full_is_judged_below_a_hundred_percent() -> None:
         signed_target=3000.0, measured=0.0, soc=BATTERY_FULL_SOC, min_soc=10.0
     )
 
-    assert state is FeatureState.UNREACHABLE_BATTERY_FULL
+    assert state is ControlStatus.UNREACHABLE_BATTERY_FULL

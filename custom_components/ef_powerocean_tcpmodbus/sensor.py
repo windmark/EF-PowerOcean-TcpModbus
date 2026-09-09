@@ -20,9 +20,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    ACTIVE_CONTROL_SENSOR,
     BATTERY_SOC_KEYS,
     CONF_BATTERY_COUNT,
+    CONTROL_STATUS_SENSOR,
     DAILY_ENERGY_SENSORS_DEVICE_RAW,
     DOMAIN,
     ENERGY_SENSOR_MAP,
@@ -70,22 +70,23 @@ async def async_setup_entry(
     for sensor in DAILY_ENERGY_SENSORS_DEVICE_RAW:
         entities.append(EcoflowSensor(coordinator, entry, sensor))
 
-    async_add_entities([*entities, EcoFlowActiveControlSensor(coordinator, entry)])
+    async_add_entities([*entities, EcoFlowControlStatusSensor(coordinator, entry)])
 
 
-class EcoFlowActiveControlSensor(EcoFlowBaseEntity, SensorEntity):
-    """What the inverter is being told to do, and why nothing is happening if so.
+class EcoFlowControlStatusSensor(EcoFlowBaseEntity, SensorEntity):
+    """Whether the selected mode is achieving anything, and why not if it isn't.
 
-    The switches say what is selected; this says what the device is being asked for
-    and whether it can deliver it, which is not the same thing.
+    The select says what was asked for; this says what the inverter is managing to
+    do about it, which is not the same thing on a device that silently ignores a
+    target the battery has no headroom for.
     """
 
     def __init__(self, coordinator: EcoflowCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator, entry, ACTIVE_CONTROL_SENSOR)
-        self._attr_device_class = ACTIVE_CONTROL_SENSOR.device_class
-        self._attr_options = list(ACTIVE_CONTROL_SENSOR.options or ())
-        if ACTIVE_CONTROL_SENSOR.icon:
-            self._attr_icon = ACTIVE_CONTROL_SENSOR.icon
+        super().__init__(coordinator, entry, CONTROL_STATUS_SENSOR)
+        self._attr_device_class = CONTROL_STATUS_SENSOR.device_class
+        self._attr_options = list(CONTROL_STATUS_SENSOR.options or ())
+        if CONTROL_STATUS_SENSOR.icon:
+            self._attr_icon = CONTROL_STATUS_SENSOR.icon
 
     @property
     def available(self) -> bool:
@@ -93,15 +94,13 @@ class EcoFlowActiveControlSensor(EcoFlowBaseEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        if not self.coordinator.heartbeat_enabled:
-            return "off"
-        return str(self.coordinator.selected_feature)
+        return str(self.coordinator.control_status)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         coordinator = self.coordinator
         return {
-            "state": str(coordinator.feature_state(coordinator.selected_feature)),
+            "mode": str(coordinator.selected_feature),
             "commanded_power": coordinator.control_power,
             "control_method": str(coordinator.control_method),
             "in_control": coordinator.in_control,

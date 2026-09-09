@@ -10,8 +10,8 @@ from .const import DOMAIN
 from .coordinator import EcoflowCoordinator
 from .models import (
     BinarySensorDef,
+    ControlEntityDef,
     EnergySensorDef,
-    FeatureEntityDef,
     NumberWritableDef,
     SensorDef,
     SwitchDef,
@@ -27,7 +27,7 @@ class EcoFlowBaseEntity(CoordinatorEntity[EcoflowCoordinator]):
         | EnergySensorDef
         | BinarySensorDef
         | NumberWritableDef
-        | FeatureEntityDef
+        | ControlEntityDef
         | SwitchDef,
     ) -> None:
         super().__init__(coordinator)

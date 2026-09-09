@@ -38,6 +38,8 @@ from .const import (
     CONTROL_FEATURES,
     CONTROL_POWER_FALLBACK_MAX,
     DEFAULT_BATTERY_COUNT,
+    DEFAULT_CHARGE_LIMIT_SOC,
+    DEFAULT_DISCHARGE_LIMIT_SOC,
     DEFAULT_INVERTER_MODEL,
     DEFAULT_MAX_GRID_POWER,
     DEFAULT_MAX_SOLAR_POWER,
@@ -69,12 +71,11 @@ from .energy_processor import EnergyProcessor
 from .models import (
     ControlFeature,
     ControlMode,
+    ControlStatus,
     CoordinatorStatus,
-    FeatureState,
     InverterModel,
     NumberWritableDef,
     RegisterType,
-    SocCondition,
     deviation_state,
     encode_register,
 )
@@ -159,20 +160,17 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         # A restart stops the heartbeat, so the device has already handed control back
         # to the app by the time we get here: automatic is the truth, not a guess.
-        # The parameters are restored from disk, the arm deliberately is not.
+        # The parameters are restored from disk, the mode deliberately is not.
         self._feature = ControlFeature.AUTOMATIC
         self._feature_power: dict[ControlFeature, float] = {
             feature: definition.default_power
             for feature, definition in CONTROL_FEATURES.items()
             if definition.has_power
         }
-        self._feature_target_soc: dict[ControlFeature, float] = {
-            feature: definition.default_target_soc
-            for feature, definition in CONTROL_FEATURES.items()
-            if definition.has_target_soc
-        }
-        # Latched so the feature does not chatter on a SOC sitting at its target.
-        self._target_soc_reached = False
+        self._charge_limit_soc = DEFAULT_CHARGE_LIMIT_SOC
+        self._discharge_limit_soc = DEFAULT_DISCHARGE_LIMIT_SOC
+        # Latched so the mode does not chatter on a SOC sitting at its limit.
+        self._soc_limit_reached = False
 
         self._commanded_feature = ControlFeature.AUTOMATIC
         self._commanded_power = 0.0
@@ -217,15 +215,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
     @property
     def selected_feature(self) -> ControlFeature:
-        """Return the feature the user switched on, driving or merely waiting."""
+        """Return the mode the user selected, running or merely waiting."""
         return self._feature
-
-    @property
-    def active_feature(self) -> ControlFeature | None:
-        """Return the feature actually moving power, if any."""
-        if self._feature is ControlFeature.AUTOMATIC or not self._heartbeat_enabled:
-            return None
-        return None if self._target_soc_reached else self._feature
 
     @property
     def control_method(self) -> ControlMode:
@@ -237,27 +228,34 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         """Return the power magnitude currently being commanded."""
         return self._commanded_power
 
+    @property
+    def charge_limit_soc(self) -> float:
+        return self._charge_limit_soc
+
+    @property
+    def discharge_limit_soc(self) -> float:
+        return self._discharge_limit_soc
+
     def feature_power(self, feature: ControlFeature) -> float:
-        """Return the configured power, or zero for a feature that has none."""
+        """Return the configured power, or zero for a mode that has none."""
         return self._feature_power.get(feature, 0.0)
 
     def feature_power_max(self, feature: ControlFeature) -> float:
         return self._control_power_ceiling(feature)
 
-    def feature_target_soc(self, feature: ControlFeature) -> float:
-        return self._feature_target_soc.get(feature, 100.0)
-
-    def feature_state(self, feature: ControlFeature) -> FeatureState:
-        """Explain, in one word, why this feature is or is not moving power."""
-        if feature is not self._feature:
-            return FeatureState.OFF
+    @property
+    def control_status(self) -> ControlStatus:
+        """Explain, in one word, what the selected mode is achieving."""
         if not self._heartbeat_enabled:
-            return FeatureState.NO_MODBUS_CONTROL
-        if self._target_soc_reached:
-            return FeatureState.WAITING_FOR_SOC
+            return ControlStatus.NO_MODBUS_CONTROL
+
+        definition = CONTROL_FEATURES[self._feature]
+        if not definition.commands_power:
+            return ControlStatus.AUTOMATIC
+        if self._soc_limit_reached:
+            return ControlStatus.WAITING_FOR_SOC
 
         data = self.data or {}
-        definition = CONTROL_FEATURES[feature]
         measured = (
             data.get(definition.measure_key)
             if definition.measure_key is not None
@@ -348,9 +346,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             "feature_power": {
                 str(feature): power for feature, power in self._feature_power.items()
             },
-            "feature_target_soc": {
-                str(feature): soc for feature, soc in self._feature_target_soc.items()
-            },
+            "charge_limit_soc": self._charge_limit_soc,
+            "discharge_limit_soc": self._discharge_limit_soc,
             **self._energy_processor.dump_state(),
         }
 
@@ -365,17 +362,16 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._energy_processor.load_state(stored)
 
     def _restore_feature_parameters(self, stored: dict[str, Any]) -> None:
-        """Restore what each feature would command, but never that it was on."""
+        """Restore what each mode would command, but never which one was selected."""
         for feature in self._feature_power:
             if (
                 power := (stored.get("feature_power") or {}).get(str(feature))
             ) is not None:
                 self._feature_power[feature] = float(power)
-        for feature in self._feature_target_soc:
-            if (
-                soc := (stored.get("feature_target_soc") or {}).get(str(feature))
-            ) is not None:
-                self._feature_target_soc[feature] = float(soc)
+        if (charge := stored.get("charge_limit_soc")) is not None:
+            self._charge_limit_soc = float(charge)
+        if (discharge := stored.get("discharge_limit_soc")) is not None:
+            self._discharge_limit_soc = float(discharge)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -584,38 +580,42 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     # ── Features ──────────────────────────────────────────────────────────────
 
     async def async_select_feature(self, feature: ControlFeature) -> None:
-        """Switch a feature on, replacing whatever was on before.
+        """Select a mode, replacing whatever was selected before.
 
-        Switching one on does not necessarily command anything: a feature whose SOC
-        target is already met waits, armed, until the state of charge moves back.
+        Selecting one does not necessarily command anything: a mode whose SOC limit
+        is already reached waits until the state of charge moves back.
         """
         if feature is not ControlFeature.AUTOMATIC:
             self._require_modbus_control()
 
         self._feature = feature
-        self._target_soc_reached = False
+        self._soc_limit_reached = False
         await self.async_apply_feature()
 
     async def async_set_feature_power(
         self, feature: ControlFeature, watts: float
     ) -> None:
-        """Set a feature's power. Editable whether or not the feature is switched on."""
+        """Set a mode's power. Editable whether or not that mode is selected."""
         self._feature_power[feature] = self._clamp_power(watts, feature)
         await self.async_apply_feature()
 
-    async def async_set_feature_target_soc(
-        self, feature: ControlFeature, soc: float
-    ) -> None:
-        """Set the SOC at which a feature stops asking for power."""
-        self._feature_target_soc[feature] = max(0.0, min(100.0, soc))
-        self._target_soc_reached = False
+    async def async_set_charge_limit_soc(self, soc: float) -> None:
+        """Set the SOC at which charging stops."""
+        self._charge_limit_soc = max(0.0, min(100.0, soc))
+        self._soc_limit_reached = False
         await self.async_apply_feature()
 
-    def _update_target_soc_reached(self, data: dict[str, Any]) -> None:
-        """Latch whether the selected feature has met its SOC target."""
+    async def async_set_discharge_limit_soc(self, soc: float) -> None:
+        """Set the SOC at which discharging and exporting stop."""
+        self._discharge_limit_soc = max(0.0, min(100.0, soc))
+        self._soc_limit_reached = False
+        await self.async_apply_feature()
+
+    def _update_soc_limit_reached(self, data: dict[str, Any]) -> None:
+        """Latch whether the selected mode has reached the limit that ends it."""
         definition = CONTROL_FEATURES[self._feature]
-        if not definition.has_target_soc:
-            self._target_soc_reached = False
+        if not definition.has_power:
+            self._soc_limit_reached = False
             return
 
         soc = data.get("battery_soc")
@@ -623,27 +623,28 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             return
 
         soc = float(soc)
-        target = self._feature_target_soc[self._feature]
-        if definition.soc_condition is SocCondition.STOP_AT_OR_ABOVE:
-            reached, released = soc >= target, soc <= target - FEATURE_SOC_HYSTERESIS
+        if definition.stops_when_charged:
+            limit = self._charge_limit_soc
+            reached, released = soc >= limit, soc <= limit - FEATURE_SOC_HYSTERESIS
         else:
-            reached, released = soc <= target, soc >= target + FEATURE_SOC_HYSTERESIS
+            limit = self._discharge_limit_soc
+            reached, released = soc <= limit, soc >= limit + FEATURE_SOC_HYSTERESIS
 
         if reached:
-            self._target_soc_reached = True
+            self._soc_limit_reached = True
         elif released:
-            self._target_soc_reached = False
+            self._soc_limit_reached = False
 
     def _desired_command(self) -> tuple[ControlFeature, float]:
         """Return what the device should be told right now.
 
-        A feature that has met its target keeps its control method with a setpoint
+        A mode that has reached its limit keeps its control method with a setpoint
         of zero rather than releasing it: dropping back to the default method would
-        let the inverter resume self-consumption and lose the arm.
+        let the inverter resume self-consumption and lose the selection.
         """
         if not self._heartbeat_enabled or self._feature is ControlFeature.AUTOMATIC:
             return ControlFeature.AUTOMATIC, 0.0
-        if self._target_soc_reached:
+        if self._soc_limit_reached:
             return self._feature, 0.0
         return self._feature, self._clamp_power(
             self.feature_power(self._feature), self._feature
@@ -652,8 +653,8 @@ class EcoflowCoordinator(DataUpdateCoordinator):
     async def async_apply_feature(
         self, data: dict[str, Any] | None = None, *, notify: bool = True
     ) -> None:
-        """Send what the selected feature asks for, if it differs from the last send."""
-        self._update_target_soc_reached(data if data is not None else self.data or {})
+        """Send what the selected mode asks for, if it differs from the last send."""
+        self._update_soc_limit_reached(data if data is not None else self.data or {})
 
         feature, power = self._desired_command()
         changed = (feature, round(power)) != (

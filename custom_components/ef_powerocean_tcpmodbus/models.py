@@ -132,11 +132,10 @@ class ControlMode(StrEnum):
 
 
 class ControlFeature(StrEnum):
-    """What the user wants the inverter to do, one at a time.
+    """What the user wants the inverter to do.
 
-    The protocol follows a single control method, so these are exclusive by nature
-    rather than by policy. Their parameters are not: those live on separately and
-    can be set up long before the feature they belong to is switched on.
+    The protocol follows a single control method, so these are the options of one
+    select rather than independent toggles.
     """
 
     AUTOMATIC = "automatic"
@@ -146,49 +145,39 @@ class ControlFeature(StrEnum):
     EXPORT_TO_GRID = "export_to_grid"
 
 
-class SocCondition(StrEnum):
-    """When a feature stops asking for power, turning a command into a policy."""
+class ControlStatus(StrEnum):
+    """What the inverter is doing about the selected mode."""
 
-    NONE = "none"
-    STOP_AT_OR_ABOVE = "stop_at_or_above"
-    STOP_AT_OR_BELOW = "stop_at_or_below"
-
-
-class FeatureState(StrEnum):
-    """Why a feature is or is not moving any power right now."""
-
-    OFF = "off"
+    NO_MODBUS_CONTROL = "no_modbus_control"
+    AUTOMATIC = "automatic"
+    WAITING_FOR_SOC = "waiting_for_soc"
     ACTIVE = "active"
     RAMPING = "ramping"
-    WAITING_FOR_SOC = "waiting_for_soc"
     UNREACHABLE_BATTERY_FULL = "unreachable_battery_full"
     UNREACHABLE_BATTERY_EMPTY = "unreachable_battery_empty"
-    NO_MODBUS_CONTROL = "no_modbus_control"
 
 
 @dataclass(frozen=True)
 class ControlFeatureDef:
-    """A feature, the instruction it sends, and the condition that ends it.
+    """A mode and the single instruction it sends.
 
     The sign lives here rather than in the user's value, so every power shown and
-    set is a positive magnitude and no combination of the two can be wrong.
+    set is a positive magnitude. It also says which state-of-charge limit ends the
+    mode: charging stops at the ceiling, discharging and exporting at the floor.
     """
 
     method: ControlMode
     # Read key of the setpoint register the method acts on; None for AUTOMATIC.
     setpoint_key: str | None = None
     sign: int = 1
-    # Telemetry key holding the quantity this feature pins, in the setpoint's sign
+    # Telemetry key holding the quantity this mode pins, in the setpoint's sign
     # convention. Comparing it against the command is the only way to tell "it is
     # working" from "the battery has no headroom left".
     measure_key: str | None = None
-    # Telemetry key holding the device's own ceiling for this feature, if it has one.
+    # Telemetry key holding the device's own ceiling for this mode, if it has one.
     limit_key: str | None = None
-    # None for a feature with no power to configure, which commands zero.
+    # None for a mode with no power to configure, which commands zero.
     default_power: float | None = None
-    soc_condition: SocCondition = SocCondition.NONE
-    default_target_soc: float = 100.0
-    icon: str | None = None
 
     @property
     def commands_power(self) -> bool:
@@ -199,16 +188,15 @@ class ControlFeatureDef:
         return self.default_power is not None
 
     @property
-    def has_target_soc(self) -> bool:
-        return self.soc_condition is not SocCondition.NONE
+    def stops_when_charged(self) -> bool:
+        return self.sign > 0
 
 
 @dataclass(frozen=True)
-class FeatureEntityDef:
-    """A switch or number belonging to a feature."""
+class ControlEntityDef:
+    """An entity that carries commanded state rather than a device register."""
 
     key: str
-    feature: ControlFeature
     icon: str | None = None
     entity_category: EntityCategory | None = None
 
@@ -228,7 +216,7 @@ def deviation_state(
     measured: float | None,
     soc: float | None,
     min_soc: float,
-) -> FeatureState:
+) -> ControlStatus:
     """Judge a setpoint that is already commanded against what the system is doing.
 
     Every control method reaches its target by moving the battery, and the device
@@ -237,20 +225,20 @@ def deviation_state(
     battery to absorb, a negative one needs it to supply.
     """
     if measured is None:
-        return FeatureState.ACTIVE
+        return ControlStatus.ACTIVE
 
     error = signed_target - measured
     tolerance = max(POWER_TOLERANCE_W, abs(signed_target) * POWER_TOLERANCE_FRACTION)
     if abs(error) <= tolerance:
-        return FeatureState.ACTIVE
+        return ControlStatus.ACTIVE
 
     if soc is not None:
         if error > 0 and soc >= BATTERY_FULL_SOC:
-            return FeatureState.UNREACHABLE_BATTERY_FULL
+            return ControlStatus.UNREACHABLE_BATTERY_FULL
         if error < 0 and soc <= min_soc + BATTERY_EMPTY_MARGIN_SOC:
-            return FeatureState.UNREACHABLE_BATTERY_EMPTY
+            return ControlStatus.UNREACHABLE_BATTERY_EMPTY
 
-    return FeatureState.RAMPING
+    return ControlStatus.RAMPING
 
 
 class RegisterType(StrEnum):

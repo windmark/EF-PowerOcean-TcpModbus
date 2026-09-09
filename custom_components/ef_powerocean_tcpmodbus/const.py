@@ -16,9 +16,11 @@ from homeassistant.const import (
 
 from .models import (
     BinarySensorDef,
+    ControlEntityDef,
     ControlFeature,
     ControlFeatureDef,
     ControlMode,
+    ControlStatus,
     CoordinatorStatus,
     EnergySensorDef,
     GridMode,
@@ -29,7 +31,6 @@ from .models import (
     RegisterDef,
     RegisterType,
     SensorDef,
-    SocCondition,
     SwitchDef,
     plan_blocks_for_model,
 )
@@ -649,7 +650,6 @@ CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
         method=ControlMode.BATTERY_LIMITS,
         setpoint_key="battery_power_setpoint",
         measure_key="battery_power",
-        icon="mdi:battery-lock",
     ),
     ControlFeature.CHARGE_BATTERY: ControlFeatureDef(
         method=ControlMode.BATTERY_LIMITS,
@@ -658,9 +658,6 @@ CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
         measure_key="battery_power",
         limit_key="battery_charge_power_limit",
         default_power=2000.0,
-        soc_condition=SocCondition.STOP_AT_OR_ABOVE,
-        default_target_soc=100.0,
-        icon="mdi:battery-charging",
     ),
     ControlFeature.DISCHARGE_BATTERY: ControlFeatureDef(
         method=ControlMode.BATTERY_LIMITS,
@@ -669,9 +666,6 @@ CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
         measure_key="battery_power",
         limit_key="battery_discharge_power_limit",
         default_power=2000.0,
-        soc_condition=SocCondition.STOP_AT_OR_BELOW,
-        default_target_soc=20.0,
-        icon="mdi:battery-arrow-down",
     ),
     ControlFeature.EXPORT_TO_GRID: ControlFeatureDef(
         method=ControlMode.SYSTEM_FEED,
@@ -680,25 +674,41 @@ CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
         measure_key="grid_power",
         limit_key="feed_in_power_max",
         default_power=3000.0,
-        soc_condition=SocCondition.STOP_AT_OR_BELOW,
-        default_target_soc=20.0,
-        icon="mdi:transmission-tower-export",
     ),
 }
 
-# Re-engaging at exactly the target would chatter on a SOC sitting on the boundary.
+BATTERY_MODE_SELECT: Final = ControlEntityDef(
+    key="battery_mode",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:home-battery",
+)
+
+# One ceiling and one floor for the whole system, applying to whichever mode runs.
+CHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
+    key="charge_limit_soc",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:battery-charging-100",
+)
+DISCHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
+    key="discharge_limit_soc",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:battery-arrow-down",
+)
+DEFAULT_CHARGE_LIMIT_SOC: Final = 100.0
+DEFAULT_DISCHARGE_LIMIT_SOC: Final = 20.0
+
+# Re-engaging at exactly the limit would chatter on a SOC sitting on the boundary.
 FEATURE_SOC_HYSTERESIS: Final = 2.0
 
-# Not a device register: what the inverter is being told to do, and why nothing is
-# happening when it looks like it should be.
-ACTIVE_CONTROL_SENSOR: Final = SensorDef(
-    key="active_control",
+# Not a device register: whether the selected mode is doing anything, and why not.
+CONTROL_STATUS_SENSOR: Final = SensorDef(
+    key="control_status",
     device_class="enum",
-    options=("off", *(str(feature) for feature in ControlFeature)),
+    options=tuple(str(status) for status in ControlStatus),
     icon="mdi:robot",
 )
 
-# Ceiling for a feature whose limit registers are all missing or read zero.
+# Ceiling for a mode whose limit registers are all missing or read zero.
 CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
 
 

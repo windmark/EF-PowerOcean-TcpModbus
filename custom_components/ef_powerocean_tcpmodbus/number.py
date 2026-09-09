@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from collections.abc import Awaitable, Callable
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
@@ -11,10 +11,17 @@ from homeassistant.const import EntityCategory, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONTROL_FEATURES, DOMAIN, UNIT_OF_RATIO, WRITABLE_NUMBERS_MAP
+from .const import (
+    CHARGE_LIMIT_SOC_NUMBER,
+    CONTROL_FEATURES,
+    DISCHARGE_LIMIT_SOC_NUMBER,
+    DOMAIN,
+    UNIT_OF_RATIO,
+    WRITABLE_NUMBERS_MAP,
+)
 from .coordinator import EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
-from .models import ControlFeature, FeatureEntityDef, NumberWritableDef
+from .models import ControlEntityDef, ControlFeature, NumberWritableDef
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,25 +37,29 @@ async def async_setup_entry(
     """Automatically set up number entities from the WRITABLE_NUMBERS_MAP configuration list."""
     coordinator: EcoflowCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[NumberEntity] = []
-    for feature, definition in CONTROL_FEATURES.items():
-        if definition.has_power:
-            entities.append(
-                EcoFlowFeaturePowerNumber(
-                    coordinator,
-                    entry,
-                    FeatureEntityDef(key=f"{feature}_power", feature=feature),
-                )
-            )
-        if definition.has_target_soc:
-            entities.append(
-                EcoFlowFeatureTargetSocNumber(
-                    coordinator,
-                    entry,
-                    FeatureEntityDef(key=f"{feature}_target_soc", feature=feature),
-                )
-            )
-
+    entities: list[NumberEntity] = [
+        EcoFlowFeaturePowerNumber(coordinator, entry, feature)
+        for feature, definition in CONTROL_FEATURES.items()
+        if definition.has_power
+    ]
+    entities.append(
+        EcoFlowSocLimitNumber(
+            coordinator,
+            entry,
+            CHARGE_LIMIT_SOC_NUMBER,
+            coordinator.async_set_charge_limit_soc,
+            lambda: coordinator.charge_limit_soc,
+        )
+    )
+    entities.append(
+        EcoFlowSocLimitNumber(
+            coordinator,
+            entry,
+            DISCHARGE_LIMIT_SOC_NUMBER,
+            coordinator.async_set_discharge_limit_soc,
+            lambda: coordinator.discharge_limit_soc,
+        )
+    )
     entities.extend(
         EcoFlowGenericNumber(coordinator, entry, number_def)
         for number_def in WRITABLE_NUMBERS_MAP
@@ -57,44 +68,34 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class EcoFlowFeatureNumber(EcoFlowBaseEntity, NumberEntity):
-    """A parameter of one feature.
+class EcoFlowFeaturePowerNumber(EcoFlowBaseEntity, NumberEntity):
+    """How much power one mode asks for while it is running.
 
-    Always editable, whether or not its feature is switched on, so a command can be
-    set up long before the conditions for it arrive. Only the selected feature's
-    values ever reach the wire.
+    Always editable, whether or not that mode is selected, so a command can be set
+    up long before it is needed. Only the selected mode's value reaches the wire.
     """
 
-    _attr_mode = NumberMode.SLIDER
+    # A precise figure matters more than dragging across an inverter's whole range.
+    _attr_mode = NumberMode.BOX
     _attr_native_min_value = 0.0
+    _attr_native_step = 100.0
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = "power"
     _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:speedometer"
 
     def __init__(
         self,
         coordinator: EcoflowCoordinator,
         entry: ConfigEntry,
-        definition: FeatureEntityDef,
+        feature: ControlFeature,
     ) -> None:
-        super().__init__(coordinator, entry, definition)
-        self._feature: ControlFeature = definition.feature
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {"state": str(self.coordinator.feature_state(self._feature))}
-
-
-class EcoFlowFeaturePowerNumber(EcoFlowFeatureNumber):
-    """How much power the feature asks for while it is running."""
-
-    _attr_native_step = 100.0
-    _attr_native_unit_of_measurement = UnitOfPower.WATT
-    _attr_device_class = "power"
-    _attr_icon = "mdi:speedometer"
+        super().__init__(coordinator, entry, ControlEntityDef(key=f"{feature}_power"))
+        self._feature = feature
 
     @property
     def native_max_value(self) -> float:
-        # The device publishes its own ceiling, and it moves with the battery, so
-        # the slider follows it rather than a configured guess.
+        # The device publishes its own ceiling, and it moves with the battery.
         return self.coordinator.feature_power_max(self._feature)
 
     @property
@@ -105,21 +106,41 @@ class EcoFlowFeaturePowerNumber(EcoFlowFeatureNumber):
         await self.coordinator.async_set_feature_power(self._feature, value)
 
 
-class EcoFlowFeatureTargetSocNumber(EcoFlowFeatureNumber):
-    """The state of charge at which the feature stops asking for power."""
+class EcoFlowSocLimitNumber(EcoFlowBaseEntity, NumberEntity):
+    """A state-of-charge limit that ends whichever mode is running.
 
+    One ceiling for charging and one floor for discharging and exporting, rather
+    than a target per mode: it is a property of the battery, not of the command.
+    """
+
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 0.0
     _attr_native_max_value = 100.0
     _attr_native_step = 1.0
     _attr_native_unit_of_measurement = UNIT_OF_RATIO
     _attr_device_class = "battery"
-    _attr_icon = "mdi:battery-check"
+
+    def __init__(
+        self,
+        coordinator: EcoflowCoordinator,
+        entry: ConfigEntry,
+        definition: ControlEntityDef,
+        setter: Callable[[float], Awaitable[None]],
+        getter: Callable[[], float],
+    ) -> None:
+        super().__init__(coordinator, entry, definition)
+        self._setter = setter
+        self._getter = getter
+        self._attr_entity_category = definition.entity_category
+        if definition.icon:
+            self._attr_icon = definition.icon
 
     @property
     def native_value(self) -> float:
-        return self.coordinator.feature_target_soc(self._feature)
+        return self._getter()
 
     async def async_set_native_value(self, value: float) -> None:
-        await self.coordinator.async_set_feature_target_soc(self._feature, value)
+        await self._setter(value)
 
 
 class EcoFlowGenericNumber(EcoFlowBaseEntity, NumberEntity):

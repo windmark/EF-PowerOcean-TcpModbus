@@ -38,17 +38,13 @@ async def async_get_config_entry_diagnostics(
             "last_heartbeat_time": coordinator.last_heartbeat_time,
             "in_control": coordinator.in_control,
             "selected_feature": str(coordinator.selected_feature),
-            "feature_state": str(
-                coordinator.feature_state(coordinator.selected_feature)
-            ),
+            "control_status": str(coordinator.control_status),
             "feature_power": {
                 str(feature): coordinator.feature_power(feature)
                 for feature in CONTROL_FEATURES
             },
-            "feature_target_soc": {
-                str(feature): coordinator.feature_target_soc(feature)
-                for feature in CONTROL_FEATURES
-            },
+            "charge_limit_soc": coordinator.charge_limit_soc,
+            "discharge_limit_soc": coordinator.discharge_limit_soc,
             "control_method": str(coordinator.control_method),
             "control_power": coordinator.control_power,
             "control_command": f"0x{coordinator.control_command:08X}",

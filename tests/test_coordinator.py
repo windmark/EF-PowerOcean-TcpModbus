@@ -29,12 +29,9 @@ def coordinator():
         for feature, definition in const.CONTROL_FEATURES.items()
         if definition.has_power
     }
-    instance._feature_target_soc = {
-        feature: definition.default_target_soc
-        for feature, definition in const.CONTROL_FEATURES.items()
-        if definition.has_target_soc
-    }
-    instance._target_soc_reached = False
+    instance._charge_limit_soc = const.DEFAULT_CHARGE_LIMIT_SOC
+    instance._discharge_limit_soc = const.DEFAULT_DISCHARGE_LIMIT_SOC
+    instance._soc_limit_reached = False
     instance._commanded_feature = models.ControlFeature.AUTOMATIC
     instance._commanded_power = 0.0
     instance._power_saving = False
@@ -213,9 +210,14 @@ def set_feature_power(coordinator, feature, watts: float):
     return asyncio.run(coordinator.async_set_feature_power(feature, watts))
 
 
-def set_feature_target_soc(coordinator, feature, soc: float):
+def set_charge_limit_soc(coordinator, soc: float):
     coordinator._lock = asyncio.Lock()
-    return asyncio.run(coordinator.async_set_feature_target_soc(feature, soc))
+    return asyncio.run(coordinator.async_set_charge_limit_soc(soc))
+
+
+def set_discharge_limit_soc(coordinator, soc: float):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_discharge_limit_soc(soc))
 
 
 def apply_feature(coordinator, data: dict | None = None):
@@ -402,7 +404,7 @@ def test_selecting_a_feature_never_takes_control_by_itself(
     assert coordinator.heartbeat_enabled is True
 
 
-def test_parameters_stay_editable_while_a_feature_is_off(
+def test_parameters_stay_editable_while_a_mode_is_not_selected(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Setting a command up before it is relevant is the point of the split."""
@@ -411,14 +413,14 @@ def test_parameters_stay_editable_while_a_feature_is_off(
     feature = models.ControlFeature.CHARGE_BATTERY
 
     set_feature_power(coordinator, feature, 4000)
-    set_feature_target_soc(coordinator, feature, 80)
+    set_charge_limit_soc(coordinator, 80)
 
     assert coordinator.feature_power(feature) == 4000.0
-    assert coordinator.feature_target_soc(feature) == 80.0
+    assert coordinator.charge_limit_soc == 80.0
     write.assert_not_awaited()
 
 
-def test_switching_a_feature_off_returns_to_automatic(
+def test_selecting_automatic_returns_control_to_the_device(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write = allow_writes(coordinator, monkeypatch)
@@ -427,81 +429,90 @@ def test_switching_a_feature_off_returns_to_automatic(
 
     select_feature(coordinator, models.ControlFeature.AUTOMATIC)
 
-    assert coordinator.active_feature is None
+    assert coordinator.control_status is models.ControlStatus.AUTOMATIC
     assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0000]
 
 
-def test_selecting_a_feature_replaces_the_previous_one(
+def test_selecting_a_mode_replaces_the_previous_one(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The protocol follows one method at a time, so features are exclusive."""
+    """The protocol follows one method at a time, so modes are exclusive."""
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
 
     select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
     select_feature(coordinator, models.ControlFeature.HOLD_BATTERY)
 
-    assert coordinator.active_feature is models.ControlFeature.HOLD_BATTERY
+    assert coordinator.selected_feature is models.ControlFeature.HOLD_BATTERY
     assert coordinator.control_power == 0.0
-    assert (
-        coordinator.feature_state(models.ControlFeature.CHARGE_BATTERY)
-        is models.FeatureState.OFF
-    )
 
 
-def test_a_feature_switched_on_at_its_target_waits_instead_of_being_refused(
+def test_a_mode_selected_at_its_limit_waits_instead_of_being_refused(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Set charging up at a full battery and it waits until the SOC drops."""
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_soc": 100.0, "battery_charge_power_limit": 5000.0}
-    feature = models.ControlFeature.CHARGE_BATTERY
-    set_feature_target_soc(coordinator, feature, 80)
+    set_charge_limit_soc(coordinator, 80)
 
-    select_feature(coordinator, feature)
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
 
-    assert coordinator.selected_feature is feature
-    assert coordinator.active_feature is None
-    assert coordinator.feature_state(feature) is models.FeatureState.WAITING_FOR_SOC
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
     # The method is held with a zero setpoint; dropping to the default method would
-    # let the inverter resume self-consumption and lose the arm.
+    # let the inverter resume self-consumption and lose the selection.
     assert coordinator.control_method is models.ControlMode.BATTERY_LIMITS
     assert coordinator.control_power == 0.0
 
 
-def test_a_waiting_feature_engages_when_the_soc_drops(
+def test_a_waiting_mode_engages_when_the_soc_drops(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_soc": 100.0, "battery_charge_power_limit": 5000.0}
     feature = models.ControlFeature.CHARGE_BATTERY
     set_feature_power(coordinator, feature, 3000)
-    set_feature_target_soc(coordinator, feature, 80)
+    set_charge_limit_soc(coordinator, 80)
     select_feature(coordinator, feature)
 
     apply_feature(coordinator, {"battery_soc": 70.0})
 
-    assert coordinator.active_feature is feature
+    assert coordinator.control_status is not models.ControlStatus.WAITING_FOR_SOC
     assert coordinator.control_power == 3000.0
 
 
-def test_a_reached_target_does_not_chatter_on_the_boundary(
+def test_the_discharge_floor_ends_an_export(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same floor serves discharging and exporting; the sign picks it."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "feed_in_power_max": 9000.0}
+    set_discharge_limit_soc(coordinator, 30)
+    select_feature(coordinator, models.ControlFeature.EXPORT_TO_GRID)
+    assert coordinator.control_power > 0
+
+    apply_feature(coordinator, {"battery_soc": 30.0})
+
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
+    assert coordinator.control_power == 0.0
+
+
+def test_a_reached_limit_does_not_chatter_on_the_boundary(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     allow_writes(coordinator, monkeypatch)
     coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
-    feature = models.ControlFeature.CHARGE_BATTERY
-    set_feature_target_soc(coordinator, feature, 80)
-    select_feature(coordinator, feature)
+    set_charge_limit_soc(coordinator, 80)
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
 
     apply_feature(coordinator, {"battery_soc": 80.0})
-    assert coordinator.active_feature is None
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
 
     apply_feature(coordinator, {"battery_soc": 81.0 - const.FEATURE_SOC_HYSTERESIS})
-    assert coordinator.active_feature is None
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
 
     apply_feature(coordinator, {"battery_soc": 80.0 - const.FEATURE_SOC_HYSTERESIS})
-    assert coordinator.active_feature is feature
+    assert coordinator.control_status is not models.ControlStatus.WAITING_FOR_SOC
 
 
 def test_automatic_writes_nothing(coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -540,7 +551,7 @@ def test_power_saving_keeps_the_control_method_in_the_word(
     set_power_saving(coordinator, True)
 
     assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0038]
-    assert coordinator.active_feature is models.ControlFeature.CHARGE_BATTERY
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
 
 
 def test_control_command_raises_when_the_device_rejects_it(
@@ -603,7 +614,7 @@ def test_a_write_failure_during_a_poll_does_not_break_the_read(
 
     asyncio.run(coordinator._async_apply_feature_safe({"battery_soc": 50.0}))
 
-    assert coordinator.active_feature is models.ControlFeature.CHARGE_BATTERY
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
 
 
 @pytest.mark.parametrize(
