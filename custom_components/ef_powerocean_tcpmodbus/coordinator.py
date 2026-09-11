@@ -27,9 +27,19 @@ from .const import (
     CONF_MAX_BATTERY_DISCHARGED_POWER,
     CONF_MAX_GRID_POWER,
     CONF_MAX_SOLAR_POWER,
+    CONF_MODBUS_CONTROL,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
+    CONTROL_COMMAND_METHOD_MASK,
+    CONTROL_COMMAND_METHOD_SHIFT,
+    CONTROL_COMMAND_POWER_SAVING_BIT,
+    CONTROL_COMMAND_REGISTER,
+    CONTROL_COMMAND_UNSAFE_BITS,
+    CONTROL_FEATURES,
+    CONTROL_POWER_FALLBACK_MAX,
     DEFAULT_BATTERY_COUNT,
+    DEFAULT_CHARGE_LIMIT_SOC,
+    DEFAULT_DISCHARGE_LIMIT_SOC,
     DEFAULT_INVERTER_MODEL,
     DEFAULT_MAX_GRID_POWER,
     DEFAULT_MAX_SOLAR_POWER,
@@ -38,7 +48,12 @@ from .const import (
     DEFAULT_SLAVE,
     DEVICE_INFO_BLOCK,
     DOMAIN,
+    FEATURE_SOC_HYSTERESIS,
     FIRMWARE_VERSION,
+    HEARTBEAT_INTERVAL_S,
+    HEARTBEAT_LAPSE_S,
+    HEARTBEAT_REGISTER,
+    HEARTBEAT_VALUE,
     MAX_BATTERY_CHARGED_POWER,
     MAX_BATTERY_DISCHARGED_POWER,
     MODBUS_DISABLED_READ_THRESHOLD,
@@ -48,10 +63,22 @@ from .const import (
     SLEEP_TIME_AFTER_RECONNECT_S,
     STATE_SAVE_DELAY_S,
     STORAGE_VERSION,
+    SYSTEM_STATE_2_CONTROL_MODE_MASK,
+    SYSTEM_STATE_2_CONTROL_MODE_SHIFT,
     register_blocks_for,
 )
 from .energy_processor import EnergyProcessor
-from .models import CoordinatorStatus, InverterModel, NumberWritableDef
+from .models import (
+    ControlFeature,
+    ControlMode,
+    ControlStatus,
+    CoordinatorStatus,
+    InverterModel,
+    NumberWritableDef,
+    RegisterType,
+    deviation_state,
+    encode_register,
+)
 from .telemetry import (
     TelemetryData,
     calculate_derived_values,
@@ -102,6 +129,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             config_entry.data.get(CONF_INVERTER_MODEL, DEFAULT_INVERTER_MODEL)
         )
         self._register_blocks = register_blocks_for(self.inverter_model)
+        self._registers_by_key = {
+            register.key: register
+            for block in self._register_blocks
+            for register in block.registers
+        }
         super().__init__(
             hass,
             _LOGGER,
@@ -121,11 +153,39 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         self._lock = asyncio.Lock()
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
+        self._last_heartbeat_time: datetime | None = None
+        self._heartbeat_enabled = config_entry.data.get(CONF_MODBUS_CONTROL, False)
+        # None until the device has answered once, so an unsupported model is logged once.
+        self._heartbeat_supported: bool | None = None
+
+        # A restart stops the heartbeat, so the device has already handed control back
+        # to the app by the time we get here: automatic is the truth, not a guess.
+        # The parameters are restored from disk, the mode deliberately is not.
+        self._feature = ControlFeature.AUTOMATIC
+        self._feature_power: dict[ControlFeature, float] = {
+            feature: definition.default_power
+            for feature, definition in CONTROL_FEATURES.items()
+            if definition.has_power
+        }
+        self._charge_limit_soc = DEFAULT_CHARGE_LIMIT_SOC
+        self._discharge_limit_soc = DEFAULT_DISCHARGE_LIMIT_SOC
+        # Latched so the mode does not chatter on a SOC sitting at its limit.
+        self._soc_limit_reached = False
+
+        self._commanded_feature = ControlFeature.AUTOMATIC
+        self._commanded_power = 0.0
+        self._power_saving = False
+        self._last_control_write_time: datetime | None = None
+        # Set when control authority may have lapsed; the next poll re-sends the word.
+        self._control_stale = False
+
         self._energy_processor = EnergyProcessor(self.limits)
         self._status: CoordinatorStatus | None = None
         self._store: Store[dict[str, Any]] | None = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.{config_entry.entry_id}.state"
         )
+
+    # ── Properties ────────────────────────────────────────────────────────────
 
     @property
     def connected(self) -> bool:
@@ -140,8 +200,141 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         """Return whether the last telemetry read indicates Modbus is disabled."""
         return self._consecutive_modbus_disabled_reads >= MODBUS_DISABLED_READ_THRESHOLD
 
+    @property
+    def heartbeat_supported(self) -> bool | None:
+        """Return whether the device accepts the heartbeat, or None if untested."""
+        return self._heartbeat_supported
+
+    @property
+    def heartbeat_enabled(self) -> bool:
+        return self._heartbeat_enabled
+
+    @property
+    def last_heartbeat_time(self) -> datetime | None:
+        return self._last_heartbeat_time
+
+    @property
+    def selected_feature(self) -> ControlFeature:
+        """Return the mode the user selected, running or merely waiting."""
+        return self._feature
+
+    @property
+    def control_method(self) -> ControlMode:
+        """Return the protocol control method currently being commanded."""
+        return CONTROL_FEATURES[self._commanded_feature].method
+
+    @property
+    def control_power(self) -> float:
+        """Return the power magnitude currently being commanded."""
+        return self._commanded_power
+
+    @property
+    def charge_limit_soc(self) -> float:
+        return self._charge_limit_soc
+
+    @property
+    def discharge_limit_soc(self) -> float:
+        return self._discharge_limit_soc
+
+    def feature_power(self, feature: ControlFeature) -> float:
+        """Return the configured power, or zero for a mode that has none."""
+        return self._feature_power.get(feature, 0.0)
+
+    def feature_power_max(self, feature: ControlFeature) -> float:
+        return self._control_power_ceiling(feature)
+
+    @property
+    def control_status(self) -> ControlStatus:
+        """Explain, in one word, what the selected mode is achieving."""
+        if not self._heartbeat_enabled:
+            return ControlStatus.NO_MODBUS_CONTROL
+
+        definition = CONTROL_FEATURES[self._feature]
+        if not definition.commands_power:
+            return ControlStatus.AUTOMATIC
+        if self._soc_limit_reached:
+            return ControlStatus.WAITING_FOR_SOC
+
+        data = self.data or {}
+        measured = (
+            data.get(definition.measure_key)
+            if definition.measure_key is not None
+            else None
+        )
+        return deviation_state(
+            signed_target=self._commanded_power * definition.sign,
+            measured=None if measured is None else float(measured),
+            soc=None if (soc := data.get("battery_soc")) is None else float(soc),
+            min_soc=float(data.get("min_soc_limit") or 0.0),
+        )
+
+    def _control_power_ceiling(self, feature: ControlFeature) -> float:
+        """Return the lowest ceiling that applies to *feature*.
+
+        Nothing can exceed the inverter's AC rating whatever the feature asks for,
+        and the device's own limit caps it further where one is published.
+        """
+        data = self.data or {}
+        definition = CONTROL_FEATURES[feature]
+        ceilings = [float(CONTROL_POWER_FALLBACK_MAX)]
+
+        if definition.limit_key is not None and (
+            limit := data.get(definition.limit_key)
+        ):
+            ceilings.append(float(limit))
+        if rated := data.get("inverter_rated_power"):
+            ceilings.append(float(rated))
+
+        return min(ceilings)
+
+    @property
+    def in_control(self) -> bool:
+        """Return whether the device is currently accepting our commands."""
+        if not self._heartbeat_enabled or self._heartbeat_supported is not True:
+            return False
+        if self._last_heartbeat_time is None:
+            return False
+        return (
+            dt.now() - self._last_heartbeat_time
+        ).total_seconds() <= HEARTBEAT_LAPSE_S
+
+    @property
+    def power_saving_commanded(self) -> bool:
+        """Return whether power saving is being commanded."""
+        return self._power_saving
+
+    @property
+    def control_command(self) -> int:
+        """Return the control command word that the commanded state composes to."""
+        return self._compose_control_command()
+
+    @property
+    def last_control_write_time(self) -> datetime | None:
+        return self._last_control_write_time
+
+    def reported_control_method(
+        self, data: dict[str, Any] | None = None
+    ) -> ControlMode | None:
+        """Return the control method the device reports in System State 2, if usable.
+
+        Bits 0-6 of System State 2 mirror System Modes, so an all-zero word on a
+        system that is reporting anything at all means the register is not
+        implemented. The PowerOcean Plus is such a unit: it would otherwise report
+        "default" forever and provoke an endless re-send of the control word.
+        """
+        source = data if data is not None else self.data
+        state = (source or {}).get("system_state_2")
+        if state is None or int(state) == 0:
+            return None
+        return ControlMode.from_command_value(
+            (int(state) >> SYSTEM_STATE_2_CONTROL_MODE_SHIFT)
+            & SYSTEM_STATE_2_CONTROL_MODE_MASK
+        )
+
     def get_pymodbus_version(self) -> str:
         return pyModbusVersion
+
+    # ── Persistence ───────────────────────────────────────────────────────────
 
     def _persisted_state(self) -> dict[str, Any]:
         """Return the state in a JSON-serializable form."""
@@ -150,6 +343,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             "last_checked_time": self._last_checked_time.isoformat()
             if self._last_checked_time is not None
             else None,
+            "feature_power": {
+                str(feature): power for feature, power in self._feature_power.items()
+            },
+            "charge_limit_soc": self._charge_limit_soc,
+            "discharge_limit_soc": self._discharge_limit_soc,
             **self._energy_processor.dump_state(),
         }
 
@@ -160,7 +358,22 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         self._last_checked_data = stored.get("last_checked_data") or {}
         self._last_checked_time = parse_datetime(stored.get("last_checked_time"))
+        self._restore_feature_parameters(stored)
         self._energy_processor.load_state(stored)
+
+    def _restore_feature_parameters(self, stored: dict[str, Any]) -> None:
+        """Restore what each mode would command, but never which one was selected."""
+        for feature in self._feature_power:
+            if (
+                power := (stored.get("feature_power") or {}).get(str(feature))
+            ) is not None:
+                self._feature_power[feature] = float(power)
+        if (charge := stored.get("charge_limit_soc")) is not None:
+            self._charge_limit_soc = float(charge)
+        if (discharge := stored.get("discharge_limit_soc")) is not None:
+            self._discharge_limit_soc = float(discharge)
+
+    # ── Connection ────────────────────────────────────────────────────────────
 
     async def async_client_shutdown(self) -> None:
         """Integration-Shutdown, closing connection"""
@@ -240,6 +453,11 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug(
                         f"Reconnect successful! (SN: {self.serial_number}) Atempts: {i + 1}/4"
                     )
+                    # The outage may have outlasted the device's 60 s window, so send
+                    # the next heartbeat at once and let the read-back re-assert the
+                    # command if it was dropped.
+                    self._last_heartbeat_time = None
+                    self._control_stale = True
                     await asyncio.sleep(SLEEP_TIME_AFTER_RECONNECT_S)
                     return True
                 self._client.close()
@@ -262,6 +480,335 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
             return res.registers
 
+    # ── Heartbeat ─────────────────────────────────────────────────────────────
+
+    async def async_send_heartbeat(self, *, force: bool = False) -> bool:
+        """Refresh Modbus control authority. Never raises; a miss only costs authority.
+
+        With *force* the register is written even if a previous attempt was rejected,
+        so a user action always gets a fresh verdict from the device.
+        """
+        if not self._heartbeat_enabled:
+            return False
+        if self._heartbeat_supported is False and not force:
+            return False
+
+        now = dt.now()
+        if self._last_heartbeat_time is not None:
+            since_last = (now - self._last_heartbeat_time).total_seconds()
+            if not force and since_last < HEARTBEAT_INTERVAL_S:
+                return True
+            if since_last > HEARTBEAT_LAPSE_S:
+                _LOGGER.debug(
+                    "Heartbeat gap of %.0fs exceeded the device window; the control "
+                    "word will be re-sent",
+                    since_last,
+                )
+                self._control_stale = True
+
+        try:
+            async with self._lock:
+                response = await self._client.write_register(
+                    address=HEARTBEAT_REGISTER,
+                    value=HEARTBEAT_VALUE,
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            # Transport trouble, not a verdict on the register: retry next poll.
+            _LOGGER.debug(f"Heartbeat write failed: {err!r}")
+            return False
+
+        if response.isError():
+            if self._heartbeat_supported is not False:
+                _LOGGER.warning(
+                    "Heartbeat register %s rejected by the device (%s). Writes will "
+                    "be acknowledged but may never take effect on this model.",
+                    HEARTBEAT_REGISTER,
+                    response,
+                )
+            self._heartbeat_supported = False
+            return False
+
+        if self._heartbeat_supported is not True:
+            _LOGGER.info(
+                "Heartbeat register %s accepted; Modbus control authority is being "
+                "refreshed every %ss.",
+                HEARTBEAT_REGISTER,
+                HEARTBEAT_INTERVAL_S,
+            )
+        self._heartbeat_supported = True
+        self._last_heartbeat_time = now
+        return True
+
+    def _require_modbus_control(self) -> None:
+        """Refuse a command the device would store and ignore."""
+        if not self._heartbeat_enabled:
+            raise HomeAssistantError(
+                "Modbus control is off. Enable Modbus Control in the integration "
+                "configuration to command the inverter; nothing was written."
+            )
+
+    async def _async_require_control_authority(self) -> None:
+        """Confirm the device is still following us before the write that follows.
+
+        The device stores every write but only acts on it while the heartbeat is
+        current, so a command sent without one looks successful and does nothing.
+        """
+        self._require_modbus_control()
+
+        if not await self.async_send_heartbeat(force=True):
+            raise HomeAssistantError(
+                f"Heartbeat write to register {HEARTBEAT_REGISTER} failed or was "
+                "rejected, so the device would ignore the command. Nothing written."
+            )
+
+    def _compose_control_command(self) -> int:
+        """Build the control word from the commanded intent and power-saving state.
+
+        System control command (0x0215)
+        """
+        method = self.control_method.command_value or 0
+        word = (method & CONTROL_COMMAND_METHOD_MASK) << CONTROL_COMMAND_METHOD_SHIFT
+        if self._power_saving:
+            word |= 1 << CONTROL_COMMAND_POWER_SAVING_BIT
+        return word
+
+    def _clamp_power(self, watts: float, feature: ControlFeature) -> float:
+        """Clamp a magnitude to zero and the device's own ceiling for *feature*."""
+        return max(0.0, min(float(watts), self._control_power_ceiling(feature)))
+
+    # ── Features ──────────────────────────────────────────────────────────────
+
+    async def async_select_feature(self, feature: ControlFeature) -> None:
+        """Select a mode, replacing whatever was selected before.
+
+        Selecting one does not necessarily command anything: a mode whose SOC limit
+        is already reached waits until the state of charge moves back.
+        """
+        if feature is not ControlFeature.AUTOMATIC:
+            self._require_modbus_control()
+
+        self._feature = feature
+        self._soc_limit_reached = False
+        await self.async_apply_feature()
+
+    async def async_set_feature_power(
+        self, feature: ControlFeature, watts: float
+    ) -> None:
+        """Set a mode's power. Editable whether or not that mode is selected."""
+        self._feature_power[feature] = self._clamp_power(watts, feature)
+        await self.async_apply_feature()
+
+    async def async_set_charge_limit_soc(self, soc: float) -> None:
+        """Set the SOC at which charging stops."""
+        self._charge_limit_soc = max(0.0, min(100.0, soc))
+        self._soc_limit_reached = False
+        await self.async_apply_feature()
+
+    async def async_set_discharge_limit_soc(self, soc: float) -> None:
+        """Set the SOC at which discharging and exporting stop."""
+        self._discharge_limit_soc = max(0.0, min(100.0, soc))
+        self._soc_limit_reached = False
+        await self.async_apply_feature()
+
+    def _update_soc_limit_reached(self, data: dict[str, Any]) -> None:
+        """Latch whether the selected mode has reached the limit that ends it."""
+        definition = CONTROL_FEATURES[self._feature]
+        if not definition.has_power:
+            self._soc_limit_reached = False
+            return
+
+        soc = data.get("battery_soc")
+        if soc is None:
+            return
+
+        soc = float(soc)
+        if definition.stops_when_charged:
+            limit = self._charge_limit_soc
+            reached, released = soc >= limit, soc <= limit - FEATURE_SOC_HYSTERESIS
+        else:
+            limit = self._discharge_limit_soc
+            reached, released = soc <= limit, soc >= limit + FEATURE_SOC_HYSTERESIS
+
+        if reached:
+            self._soc_limit_reached = True
+        elif released:
+            self._soc_limit_reached = False
+
+    def _desired_command(self) -> tuple[ControlFeature, float]:
+        """Return what the device should be told right now.
+
+        A mode that has reached its limit keeps its control method with a setpoint
+        of zero rather than releasing it: dropping back to the default method would
+        let the inverter resume self-consumption and lose the selection.
+        """
+        if not self._heartbeat_enabled or self._feature is ControlFeature.AUTOMATIC:
+            return ControlFeature.AUTOMATIC, 0.0
+        if self._soc_limit_reached:
+            return self._feature, 0.0
+        return self._feature, self._clamp_power(
+            self.feature_power(self._feature), self._feature
+        )
+
+    async def async_apply_feature(
+        self, data: dict[str, Any] | None = None, *, notify: bool = True
+    ) -> None:
+        """Send what the selected mode asks for, if it differs from the last send."""
+        self._update_soc_limit_reached(data if data is not None else self.data or {})
+
+        feature, power = self._desired_command()
+        changed = (feature, round(power)) != (
+            self._commanded_feature,
+            round(self._commanded_power),
+        )
+        self._commanded_feature = feature
+        self._commanded_power = power
+
+        try:
+            if changed or self._control_stale:
+                await self._async_send_control(feature, power)
+        finally:
+            if notify:
+                self.async_update_listeners()
+
+    async def _async_send_control(self, feature: ControlFeature, power: float) -> None:
+        """Write the setpoint and then the control word that selects its method."""
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
+
+        if CONTROL_FEATURES[feature].commands_power:
+            await self._async_require_control_authority()
+            await self._async_write_setpoint(feature, power)
+
+        await self._async_write_control_word(self._compose_control_command())
+        self._last_control_write_time = dt.now()
+        self._control_stale = False
+
+    async def _async_apply_feature_safe(self, data: dict[str, Any]) -> None:
+        """Run from a poll, where a write failure must not stop the read."""
+        try:
+            await self.async_apply_feature(data, notify=False)
+        except HomeAssistantError as err:
+            _LOGGER.debug(f"Could not apply {self._feature} this poll: {err!r}")
+
+    async def _async_write_setpoint(
+        self, feature: ControlFeature, watts: float
+    ) -> None:
+        """Write the register the feature's method acts on, with the feature's sign."""
+        definition = CONTROL_FEATURES[feature]
+        if definition.setpoint_key is None:
+            return
+        try:
+            register = self._registers_by_key[definition.setpoint_key]
+        except KeyError as err:
+            raise HomeAssistantError(
+                f"No register mapped for setpoint {definition.setpoint_key} on "
+                f"{self.inverter_model}"
+            ) from err
+        value = int(round(watts)) * definition.sign
+
+        try:
+            words = encode_register(value, RegisterType.INT32)
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+
+        _LOGGER.debug(
+            "Sending Modbus write command [FC16]: %sW as %s to address %s (%s)",
+            value,
+            [f"0x{word:04X}" for word in words],
+            register.address,
+            definition.setpoint_key,
+        )
+
+        try:
+            async with self._lock:
+                response = await self._client.write_registers(
+                    address=register.address,
+                    values=words,
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(
+                f"Setpoint {value} W could not be sent to {register.address}: {err!r}"
+            ) from err
+
+        if response.isError():
+            raise HomeAssistantError(
+                f"Modbus rejected setpoint {value} W to {register.address}: {response}"
+            )
+
+    async def async_set_power_saving(self, enabled: bool) -> None:
+        """Command power-saving mode without disturbing the control intent."""
+        previous = self._power_saving
+        self._power_saving = enabled
+        try:
+            await self._async_apply_control_command()
+        except HomeAssistantError:
+            self._power_saving = previous
+            raise
+
+    async def _async_apply_control_command(self) -> None:
+        """Write the composed control word once and refresh so the read-back shows it."""
+        value = self._compose_control_command()
+        if value & CONTROL_COMMAND_UNSAFE_BITS:
+            raise HomeAssistantError(
+                f"Refusing control command 0x{value:08X}: it would take the system "
+                "off-grid or shut it down."
+            )
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
+
+        # Power saving applies on its own, like the LED brightness does. Only a
+        # control method needs the app locked out, so only it takes control.
+        if CONTROL_FEATURES[self._commanded_feature].commands_power:
+            await self._async_require_control_authority()
+
+        await self._async_write_control_word(value)
+        self._last_control_write_time = dt.now()
+        self._control_stale = False
+        self.async_update_listeners()
+        await self.async_refresh()
+
+    async def _async_write_control_word(self, value: int) -> None:
+        _LOGGER.debug(
+            "Sending Modbus write command [FC16]: 0x%08X to address %s (Device ID: %s)",
+            value,
+            CONTROL_COMMAND_REGISTER,
+            self._client_slave_id,
+        )
+
+        try:
+            async with self._lock:
+                response = await self._client.write_registers(
+                    address=CONTROL_COMMAND_REGISTER,
+                    values=encode_register(value, RegisterType.UINT32),
+                    device_id=self._client_slave_id,
+                )
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(
+                f"Control command 0x{value:08X} could not be sent: {err!r}"
+            ) from err
+
+        if response.isError():
+            raise HomeAssistantError(
+                f"Modbus rejected control command 0x{value:08X}: {response}"
+            )
+
+    def _log_state_word_changes(self, data: dict[str, Any]) -> None:
+        """Trace the raw status words, so any reaction to a command is visible."""
+        for key in ("system_modes", "system_state_2"):
+            new_value = data.get(key)
+            previous = self._last_checked_data.get(key)
+            if new_value is None or new_value == previous:
+                continue
+            _LOGGER.debug(
+                "%s changed 0x%08X -> 0x%08X (commanding 0x%08X)",
+                key,
+                int(previous or 0),
+                int(new_value),
+                self._compose_control_command(),
+            )
+
     async def async_get_raw_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
 
@@ -269,8 +816,9 @@ class EcoflowCoordinator(DataUpdateCoordinator):
         if not self._client.connected and not await self.async_reconnect():
             raise UpdateFailed("Reconnect failed!")
 
+        await self.async_send_heartbeat()
+
         try:
-            # Read all register blocks
             for register_block in self._register_blocks:
                 raw = await self.async_read_block(
                     register_block.start, register_block.count
@@ -300,6 +848,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 )
                 data["battery_count"] = configured_battery_count
 
+            await self._async_apply_feature_safe(data)
             return data
         except ModbusException as err:
             _LOGGER.debug(f"{err.string}. Connection closing...")
@@ -341,6 +890,7 @@ class EcoflowCoordinator(DataUpdateCoordinator):
                 result, self._last_checked_data, is_daily_reset=is_daily_reset
             )
 
+            self._log_state_word_changes(result)
             self._last_checked_data = dict(result)
             self._last_checked_time = dt.now()
             self._status = CoordinatorStatus.SUCCESS
@@ -353,22 +903,33 @@ class EcoflowCoordinator(DataUpdateCoordinator):
             _LOGGER.error(f"Unexpected error during data fetch: {repr(err)}")
             return None
 
+    # ── Parameter and setpoint writes ─────────────────────────────────────────
+
     async def async_write_modbus_register(
         self, entity_def: NumberWritableDef, value: int
     ) -> None:
-        """Universal method to write a 16-bit unsigned integer to any Modbus register."""
-        if not self._client or not self.connected:
-            _LOGGER.error("Modbus client is not initialized")
-            return
+        """Write a device setting and verify it by reading it back.
+
+        Settings apply without Modbus control authority, unlike the control word and
+        its setpoints, so this never takes control away from the EcoFlow app.
+        """
+        if not self.connected:
+            raise HomeAssistantError("Modbus client is not connected")
 
         target_value = int(value)
-
         register_address = entity_def.register
         key = entity_def.read_key
 
+        try:
+            words = encode_register(target_value, entity_def.data_type)
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+
         _LOGGER.debug(
-            "Sending Modbus write command [FC6]: value %s to address %s (Key: %s, Device ID: %s)",
+            "Sending Modbus write command [%s]: value %s -> %s to address %s (Key: %s, Device ID: %s)",
+            "FC6" if len(words) == 1 else "FC16",
             target_value,
+            [f"0x{word:04X}" for word in words],
             register_address,
             key,
             self._client_slave_id,
@@ -376,54 +937,56 @@ class EcoflowCoordinator(DataUpdateCoordinator):
 
         try:
             async with self._lock:
-                # Execute write single register operation
-                response = await self._client.write_register(
-                    address=register_address,
-                    value=target_value,
-                    device_id=self._client_slave_id,
-                )
-
-                if response.isError():
-                    _LOGGER.error(
-                        "Modbus error response when writing to register %s: %s",
-                        register_address,
-                        response,
+                if len(words) == 1:
+                    response = await self._client.write_register(
+                        address=register_address,
+                        value=words[0],
+                        device_id=self._client_slave_id,
                     )
+                else:
+                    response = await self._client.write_registers(
+                        address=register_address,
+                        values=words,
+                        device_id=self._client_slave_id,
+                    )
+                if response.isError():
                     raise HomeAssistantError(
-                        f"Modbus rejected write operation for register {register_address}: {response}"
+                        f"Modbus rejected write to register {register_address}: {response}"
                     )
 
                 readback_response = await self._client.read_holding_registers(
                     address=register_address,
-                    count=1,
+                    count=len(words),
                     device_id=self._client_slave_id,
                 )
                 if readback_response.isError():
                     raise HomeAssistantError(
                         f"Could not verify write to register {register_address}: {readback_response}"
                     )
+                readback_words = list(readback_response.registers)
+        except (ModbusException, ConnectionError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(
+                f"Error writing register {register_address} via Modbus TCP: {err!r}"
+            ) from err
 
-                readback_value = readback_response.registers[0]
-
-            if readback_value != target_value:
-                raise HomeAssistantError(
-                    f"Register {register_address} acknowledged value {target_value}, "
-                    f"but read back {readback_value}"
-                )
-
-            _LOGGER.info(
-                "Register %s [%s] successfully updated to value: %s",
-                register_address,
-                key,
-                target_value,
+        readback_value = decode_register(readback_words, entity_def.data_type)
+        # A 32-bit register echoes the words just written and only swaps them into
+        # read order a few seconds later, so either form means the write landed.
+        if readback_words != words and (
+            readback_value is None or int(readback_value) != target_value
+        ):
+            raise HomeAssistantError(
+                f"Register {register_address} acknowledged value {target_value}, "
+                f"but read back {readback_value}"
             )
 
-            updated_data = {**(self.data or {}), key: target_value}
-            self.async_set_updated_data(updated_data)
-        except Exception as err:
-            _LOGGER.error(
-                "Failed to write to register %s via Modbus TCP: %s",
-                entity_def.register,
-                err,
-            )
-            raise HomeAssistantError(f"Error writing data to inverter: {err}")
+        _LOGGER.info(
+            "Register %s [%s] acknowledged value: %s (the device may still ignore "
+            "it; confirm the effect, not the readback)",
+            register_address,
+            key,
+            target_value,
+        )
+
+        updated_data = {**(self.data or {}), key: target_value}
+        self.async_set_updated_data(updated_data)

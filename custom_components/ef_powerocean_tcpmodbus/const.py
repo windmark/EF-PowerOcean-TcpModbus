@@ -16,6 +16,11 @@ from homeassistant.const import (
 
 from .models import (
     BinarySensorDef,
+    ControlEntityDef,
+    ControlFeature,
+    ControlFeatureDef,
+    ControlMode,
+    ControlStatus,
     CoordinatorStatus,
     EnergySensorDef,
     GridMode,
@@ -26,6 +31,7 @@ from .models import (
     RegisterDef,
     RegisterType,
     SensorDef,
+    SwitchDef,
     plan_blocks_for_model,
 )
 
@@ -47,6 +53,7 @@ CONF_MAX_BATTERY_CHARGED_POWER: Final = "battery_charged_power_max"
 CONF_MAX_BATTERY_DISCHARGED_POWER: Final = "battery_discharged_power_max"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_CALC_SOLAR_POWER: Final = "calc_solar_power"
+CONF_MODBUS_CONTROL: Final = "modbus_control"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 
 MAX_BATTERY_CHARGED_POWER: Final = 2500
@@ -55,6 +62,37 @@ MAX_BATTERY_COUNT: Final = 12
 MAX_FAULT_EVENTS: Final = 20
 
 SLEEP_TIME_AFTER_RECONNECT_S: Final = 1
+
+# The device stores writes but acts on none of them unless this register is written
+# at least once a minute. Sent well inside that window so a missed poll is harmless.
+HEARTBEAT_REGISTER: Final = 40608
+HEARTBEAT_INTERVAL_S: Final = 20
+HEARTBEAT_VALUE: Final = 1
+# The device's own window. A gap longer than this means it has dropped Modbus
+# control and re-inherited the app settings, so the control word is sent again.
+HEARTBEAT_LAPSE_S: Final = 60
+
+# 0x0215, write-only. Bit 0 forces the system off-grid and bit 1 shuts it down, so a
+# command touching either is refused before it reaches the wire. Bit 3 is the
+# power-saving switch and bits 4-7 select the control method; the setpoint registers
+# only take effect while their control method is selected here.
+CONTROL_COMMAND_REGISTER: Final = 40534
+CONTROL_COMMAND_UNSAFE_BITS: Final = 0b11
+CONTROL_COMMAND_POWER_SAVING_BIT: Final = 3
+CONTROL_COMMAND_METHOD_SHIFT: Final = 4
+CONTROL_COMMAND_METHOD_MASK: Final = 0xF
+
+# System Status (0x0211) bit 3 reports whether low-power (power-saving) mode is
+# currently engaged. It is a status, not an echo of the command bit: while the
+# battery is working it stays 0 even if power saving is enabled.
+SYSTEM_STATUS_LOW_POWER_BIT: Final = 3
+
+# System State 2 (0x0213) reports the control method the device is actually
+# following in bits 7-10. It reads 0 on a PowerOcean Plus, where the register is not
+# implemented, so it is never treated as a read-back of the command.
+SYSTEM_STATE_2_CONTROL_MODE_SHIFT: Final = 7
+SYSTEM_STATE_2_CONTROL_MODE_MASK: Final = 0xF
+
 ENERGY_RESOLUTION_KWH: Final = 0.01
 STORAGE_VERSION: Final = 1
 STATE_SAVE_DELAY_S: Final = 30
@@ -92,6 +130,7 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
     RegisterDef("battery_soc", 40527, RegisterType.UINT16),
     RegisterDef("inverter_rated_power", 40528, RegisterType.UINT32),
     RegisterDef("system_modes", 40530, RegisterType.UINT32),
+    RegisterDef("system_state_2", 40532, RegisterType.UINT32),
     RegisterDef("min_soc_limit", 40536, RegisterType.UINT16),
     RegisterDef(
         "feed_in_power_max",
@@ -100,11 +139,15 @@ MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
         address_overrides={InverterModel.POWEROCEAN_PLUS: 40538},
     ),
     RegisterDef("device_led_brightness", 40541, RegisterType.UINT16),
+    # Setpoints that take effect the moment the matching control method is engaged.
+    RegisterDef("system_power_setpoint", 40542, RegisterType.INT32),
+    RegisterDef("inverter_power_setpoint", 40544, RegisterType.INT32),
     RegisterDef("limit_inv_power", 40546, RegisterType.UINT32),
     RegisterDef("limit_inv_max", 40548, RegisterType.UINT32),
     RegisterDef("battery_capacity", 40552, RegisterType.UINT32),
     RegisterDef("battery_discharge_power_limit", 40554, RegisterType.UINT32),
     RegisterDef("battery_charge_power_limit", 40556, RegisterType.UINT32),
+    RegisterDef("battery_power_setpoint", 40571, RegisterType.INT32),
     RegisterDef("battery_voltage", 40574),
     RegisterDef("battery_current", 40576),
     RegisterDef("battery_temperature", 40578),
@@ -158,6 +201,13 @@ SENSOR_MAP: list[SensorDef] = [
         unit=None,
         device_class=None,
         state_class="measurement",
+    ),
+    SensorDef(
+        key="system_state_2",
+        unit=None,
+        device_class=None,
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     SensorDef(
         key="house_power",
@@ -430,6 +480,28 @@ SENSOR_MAP: list[SensorDef] = [
         icon="mdi:home-lightning-bolt",
     ),
     SensorDef(
+        key="inverter_output_power",
+        unit=UnitOfPower.WATT,
+        device_class="power",
+        state_class="measurement",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:sine-wave",
+    ),
+    *[
+        SensorDef(
+            key=key,
+            unit=UnitOfPower.WATT,
+            device_class="power",
+            state_class="measurement",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for key in (
+            "system_power_setpoint",
+            "inverter_power_setpoint",
+            "battery_power_setpoint",
+        )
+    ],
+    SensorDef(
         key="fault_count",
         state_class="measurement",
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -535,6 +607,90 @@ BINARY_SENSOR_MAP: list[BinarySensorDef] = [
 ]
 
 
+# Not a device register: whether the heartbeat currently holds control authority.
+MODBUS_CONTROL_BINARY_SENSOR: Final = BinarySensorDef(
+    key="modbus_control",
+    device_class="running",
+    entity_category=EntityCategory.DIAGNOSTIC,
+)
+
+# Written as bit 3 of the control command register; read back as battery_saver_mode_ena.
+POWER_SAVING_SWITCH: Final = SwitchDef(
+    key="battery_saver_mode_control",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:leaf",
+)
+
+# Everything the user can ask for, and what it means on the wire. The protocol
+# follows one control method at a time, so exactly one of these is ever in force.
+CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
+    ControlFeature.AUTOMATIC: ControlFeatureDef(method=ControlMode.DEFAULT),
+    ControlFeature.HOLD_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        measure_key="battery_power",
+    ),
+    ControlFeature.CHARGE_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=1,
+        measure_key="battery_power",
+        limit_key="battery_charge_power_limit",
+        default_power=2000.0,
+    ),
+    ControlFeature.DISCHARGE_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=-1,
+        measure_key="battery_power",
+        limit_key="battery_discharge_power_limit",
+        default_power=2000.0,
+    ),
+    ControlFeature.EXPORT_TO_GRID: ControlFeatureDef(
+        method=ControlMode.SYSTEM_FEED,
+        setpoint_key="system_power_setpoint",
+        sign=-1,
+        measure_key="grid_power",
+        limit_key="feed_in_power_max",
+        default_power=3000.0,
+    ),
+}
+
+BATTERY_MODE_SELECT: Final = ControlEntityDef(
+    key="battery_mode",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:home-battery",
+)
+
+# One ceiling and one floor for the whole system, applying to whichever mode runs.
+CHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
+    key="charge_limit_soc",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:battery-charging-100",
+)
+DISCHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
+    key="discharge_limit_soc",
+    entity_category=EntityCategory.CONFIG,
+    icon="mdi:battery-arrow-down",
+)
+DEFAULT_CHARGE_LIMIT_SOC: Final = 100.0
+DEFAULT_DISCHARGE_LIMIT_SOC: Final = 20.0
+
+# Re-engaging at exactly the limit would chatter on a SOC sitting on the boundary.
+FEATURE_SOC_HYSTERESIS: Final = 2.0
+
+# Not a device register: whether the selected mode is doing anything, and why not.
+CONTROL_STATUS_SENSOR: Final = SensorDef(
+    key="control_status",
+    device_class="enum",
+    options=tuple(str(status) for status in ControlStatus),
+    icon="mdi:robot",
+)
+
+# Ceiling for a mode whose limit registers are all missing or read zero.
+CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
+
+
 # Map of all modbus registers available for writing operations.
 WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
     NumberWritableDef(
@@ -547,6 +703,8 @@ WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
         step=1.0,
         unit=UNIT_OF_RATIO,
         device_class="battery",
+        # Accepted and ignored on a PowerOcean Plus; it works on the 1ph/3ph models.
+        advanced=True,
     ),
     NumberWritableDef(
         key="device_led_brightness_control",

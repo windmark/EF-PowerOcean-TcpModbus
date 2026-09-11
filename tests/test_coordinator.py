@@ -20,6 +20,26 @@ def coordinator():
     )
     instance._last_checked_data = {}
     instance._last_checked_time = None
+    instance._last_heartbeat_time = None
+    instance._heartbeat_supported = None
+    instance._heartbeat_enabled = True
+    instance._feature = models.ControlFeature.AUTOMATIC
+    instance._feature_power = {
+        feature: definition.default_power
+        for feature, definition in const.CONTROL_FEATURES.items()
+        if definition.has_power
+    }
+    instance._charge_limit_soc = const.DEFAULT_CHARGE_LIMIT_SOC
+    instance._discharge_limit_soc = const.DEFAULT_DISCHARGE_LIMIT_SOC
+    instance._soc_limit_reached = False
+    instance._commanded_feature = models.ControlFeature.AUTOMATIC
+    instance._commanded_power = 0.0
+    instance._power_saving = False
+    instance._last_control_write_time = None
+    instance._control_stale = False
+    instance._client = Mock()
+    instance._client_slave_id = 1
+    instance._lock = asyncio.Lock()
     instance._status = None
     instance._store = None
     instance.serial_number = None
@@ -27,6 +47,11 @@ def coordinator():
     instance._ena_calc_solar_power = False
     instance.inverter_model = const.DEFAULT_INVERTER_MODEL
     instance._register_blocks = const.register_blocks_for(instance.inverter_model)
+    instance._registers_by_key = {
+        register.key: register
+        for block in instance._register_blocks
+        for register in block.registers
+    }
     instance.limits = {
         const.CONF_MAX_GRID_POWER: 15_000,
         const.CONF_MAX_SOLAR_POWER: 12_000,
@@ -59,6 +84,537 @@ def run_update(
     coordinator.async_get_raw_data = AsyncMock(return_value=dict(raw_data))
     monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
     return asyncio.run(coordinator._async_update_data())
+
+
+HEARTBEAT_START = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def send_heartbeat(
+    coordinator,
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force: bool = False,
+) -> bool:
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: now)
+    # asyncio.run() builds a fresh loop per call, and a lock binds to the first one.
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_send_heartbeat(force=force))
+
+
+def heartbeat_response(coordinator, *, is_error: bool) -> AsyncMock:
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=is_error))
+    )
+    return coordinator._client.write_register
+
+
+def test_heartbeat_is_sent_at_most_once_per_interval(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=False)
+    interval = const.HEARTBEAT_INTERVAL_S
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is True
+    assert coordinator.heartbeat_supported is True
+
+    too_soon = HEARTBEAT_START + timedelta(seconds=interval - 1)
+    assert send_heartbeat(coordinator, too_soon, monkeypatch) is True
+    assert write.await_count == 1
+
+    due = HEARTBEAT_START + timedelta(seconds=interval)
+    assert send_heartbeat(coordinator, due, monkeypatch) is True
+    assert write.await_count == 2
+
+
+def test_forced_heartbeat_before_a_write_ignores_the_interval(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=False)
+
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch)
+    send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch, force=True)
+
+    assert write.await_count == 2
+
+
+def test_heartbeat_stops_once_the_device_rejects_the_register(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = heartbeat_response(coordinator, is_error=True)
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert coordinator.heartbeat_supported is False
+
+    # A rejection latches it off for polling, but a user action still re-probes.
+    later = HEARTBEAT_START + timedelta(minutes=5)
+    assert send_heartbeat(coordinator, later, monkeypatch) is False
+    assert write.await_count == 1
+
+    assert send_heartbeat(coordinator, later, monkeypatch, force=True) is False
+    assert write.await_count == 2
+
+
+def test_transport_failure_retries_instead_of_disabling_the_heartbeat(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator._client.write_register = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is False
+    assert coordinator.heartbeat_supported is None
+    assert coordinator.last_heartbeat_time is None
+
+    write = heartbeat_response(coordinator, is_error=False)
+    assert send_heartbeat(coordinator, HEARTBEAT_START, monkeypatch) is True
+    assert write.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("entry_data", "expected"),
+    [({}, False), ({const.CONF_MODBUS_CONTROL: True}, True)],
+)
+def test_heartbeat_enablement_comes_from_config_entry(
+    monkeypatch: pytest.MonkeyPatch, entry_data: dict, expected: bool
+) -> None:
+    monkeypatch.setattr(
+        coordinator_module.DataUpdateCoordinator,
+        "__init__",
+        lambda self, *args, **kwargs: setattr(self, "data", None),
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "AsyncModbusTcpClient",
+        lambda *args, **kwargs: Mock(connected=False),
+    )
+    config_entry = SimpleNamespace(data=entry_data, entry_id="test")
+
+    instance = coordinator_module.EcoflowCoordinator(Mock(), config_entry)
+
+    assert instance.heartbeat_enabled is expected
+
+
+def set_power_saving(coordinator, enabled: bool):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_power_saving(enabled))
+
+
+def select_feature(coordinator, feature):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_select_feature(feature))
+
+
+def set_feature_power(coordinator, feature, watts: float):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_feature_power(feature, watts))
+
+
+def set_charge_limit_soc(coordinator, soc: float):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_charge_limit_soc(soc))
+
+
+def set_discharge_limit_soc(coordinator, soc: float):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_set_discharge_limit_soc(soc))
+
+
+def apply_feature(coordinator, data: dict | None = None):
+    coordinator._lock = asyncio.Lock()
+    return asyncio.run(coordinator.async_apply_feature(data))
+
+
+def allow_writes(coordinator, monkeypatch: pytest.MonkeyPatch, *, is_error=False):
+    monkeypatch.setattr(coordinator_module.dt, "now", lambda: HEARTBEAT_START)
+    coordinator._client.connected = True
+    coordinator._client.write_register = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=False))
+    )
+    coordinator._client.write_registers = AsyncMock(
+        return_value=Mock(isError=Mock(return_value=is_error))
+    )
+    coordinator.async_refresh = AsyncMock()
+    coordinator.async_update_listeners = Mock()
+    return coordinator._client.write_registers
+
+
+def test_control_command_refuses_off_grid_and_shutdown_bits(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    # Nothing composable through the public API sets them, so bend the bit to reach
+    # the guard: power saving now lands on BIT0, which takes the system off-grid.
+    monkeypatch.setattr(coordinator_module, "CONTROL_COMMAND_POWER_SAVING_BIT", 0)
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_power_saving(coordinator, True)
+
+    write.assert_not_awaited()
+
+
+def test_control_command_writes_both_words_high_word_first(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+
+    set_power_saving(coordinator, True)
+
+    # The device parses multi-register writes high word first, unlike its reads.
+    write.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0000, 0x0008],
+        device_id=1,
+    )
+    coordinator.async_refresh.assert_awaited_once()
+    assert coordinator.control_command == 0b1000
+
+
+def test_feature_composes_the_method_nibble_without_losing_power_saving(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._power_saving = True
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    assert write.await_args_list[-1].kwargs == {
+        "address": const.CONTROL_COMMAND_REGISTER,
+        "values": [0x0000, 0x0038],
+        "device_id": 1,
+    }
+
+
+def test_switching_on_writes_the_features_own_power(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The feature owns its value, so nothing is inherited from the last session."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    set_feature_power(coordinator, models.ControlFeature.CHARGE_BATTERY, 2500)
+
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    assert coordinator.control_power == 2500.0
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+    assert write.await_args_list[0].kwargs == {
+        "address": setpoint,
+        "values": [0x0000, 0x09C4],
+        "device_id": 1,
+    }
+
+
+def test_setpoint_uses_the_model_resolved_register_address(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._registers_by_key["battery_power_setpoint"] = models.RegisterDef(
+        "battery_power_setpoint", 49999, models.RegisterType.INT32
+    )
+
+    asyncio.run(
+        coordinator._async_write_setpoint(models.ControlFeature.CHARGE_BATTERY, 2500)
+    )
+
+    write.assert_awaited_once_with(
+        address=49999,
+        values=[0x0000, 0x09C4],
+        device_id=1,
+    )
+
+
+def test_discharge_feature_sends_the_magnitude_as_a_negative_setpoint(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_discharge_power_limit": 5000.0}
+    select_feature(coordinator, models.ControlFeature.DISCHARGE_BATTERY)
+
+    set_feature_power(coordinator, models.ControlFeature.DISCHARGE_BATTERY, 1500)
+
+    assert coordinator.control_power == 1500.0
+    # -1500 as INT32, high word first.
+    assert write.await_args_list[-2].kwargs["values"] == [0xFFFF, 0xFA24]
+
+
+def test_feature_power_is_clamped_to_the_device_limit(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 3000.0}
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    set_feature_power(coordinator, models.ControlFeature.CHARGE_BATTERY, 9999)
+
+    assert coordinator.control_power == 3000.0
+
+
+def test_no_feature_may_exceed_the_inverter_rating(coordinator) -> None:
+    """The AC rating bounds the slider whatever a feature's own limit says."""
+    coordinator.data = {
+        "inverter_rated_power": 11000.0,
+        "battery_charge_power_limit": 25000.0,
+        "feed_in_power_max": 9000.0,
+    }
+
+    ceilings = {
+        feature: coordinator._control_power_ceiling(feature)
+        for feature in models.ControlFeature
+    }
+
+    assert ceilings[models.ControlFeature.CHARGE_BATTERY] == 11000.0
+    # A tighter published limit still wins over the rating.
+    assert ceilings[models.ControlFeature.EXPORT_TO_GRID] == 9000.0
+
+
+def test_ceiling_falls_back_when_the_device_publishes_nothing(coordinator) -> None:
+    coordinator.data = {"inverter_rated_power": 0.0}
+
+    ceiling = coordinator._control_power_ceiling(models.ControlFeature.CHARGE_BATTERY)
+
+    assert ceiling == float(const.CONTROL_POWER_FALLBACK_MAX)
+
+
+def test_switching_a_feature_on_needs_modbus_control(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    assert coordinator.selected_feature is models.ControlFeature.AUTOMATIC
+    write.assert_not_awaited()
+
+
+def test_selecting_a_feature_never_takes_control_by_itself(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Modbus Control config is the user's gate; features do not change it."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+    assert coordinator.heartbeat_enabled is True
+
+    select_feature(coordinator, models.ControlFeature.AUTOMATIC)
+    assert coordinator.heartbeat_enabled is True
+
+
+def test_parameters_stay_editable_while_a_mode_is_not_selected(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setting a command up before it is relevant is the point of the split."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    feature = models.ControlFeature.CHARGE_BATTERY
+
+    set_feature_power(coordinator, feature, 4000)
+    set_charge_limit_soc(coordinator, 80)
+
+    assert coordinator.feature_power(feature) == 4000.0
+    assert coordinator.charge_limit_soc == 80.0
+    write.assert_not_awaited()
+
+
+def test_selecting_automatic_returns_control_to_the_device(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    select_feature(coordinator, models.ControlFeature.AUTOMATIC)
+
+    assert coordinator.control_status is models.ControlStatus.AUTOMATIC
+    assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0000]
+
+
+def test_selecting_a_mode_replaces_the_previous_one(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protocol follows one method at a time, so modes are exclusive."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+    select_feature(coordinator, models.ControlFeature.HOLD_BATTERY)
+
+    assert coordinator.selected_feature is models.ControlFeature.HOLD_BATTERY
+    assert coordinator.control_power == 0.0
+
+
+def test_a_mode_selected_at_its_limit_waits_instead_of_being_refused(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Set charging up at a full battery and it waits until the SOC drops."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 100.0, "battery_charge_power_limit": 5000.0}
+    set_charge_limit_soc(coordinator, 80)
+
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
+    # The method is held with a zero setpoint; dropping to the default method would
+    # let the inverter resume self-consumption and lose the selection.
+    assert coordinator.control_method is models.ControlMode.BATTERY_LIMITS
+    assert coordinator.control_power == 0.0
+
+
+def test_a_waiting_mode_engages_when_the_soc_drops(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 100.0, "battery_charge_power_limit": 5000.0}
+    feature = models.ControlFeature.CHARGE_BATTERY
+    set_feature_power(coordinator, feature, 3000)
+    set_charge_limit_soc(coordinator, 80)
+    select_feature(coordinator, feature)
+
+    apply_feature(coordinator, {"battery_soc": 70.0})
+
+    assert coordinator.control_status is not models.ControlStatus.WAITING_FOR_SOC
+    assert coordinator.control_power == 3000.0
+
+
+def test_the_discharge_floor_ends_an_export(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same floor serves discharging and exporting; the sign picks it."""
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "feed_in_power_max": 9000.0}
+    set_discharge_limit_soc(coordinator, 30)
+    select_feature(coordinator, models.ControlFeature.EXPORT_TO_GRID)
+    assert coordinator.control_power > 0
+
+    apply_feature(coordinator, {"battery_soc": 30.0})
+
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
+    assert coordinator.control_power == 0.0
+
+
+def test_a_reached_limit_does_not_chatter_on_the_boundary(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    set_charge_limit_soc(coordinator, 80)
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    apply_feature(coordinator, {"battery_soc": 80.0})
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
+
+    apply_feature(coordinator, {"battery_soc": 81.0 - const.FEATURE_SOC_HYSTERESIS})
+    assert coordinator.control_status is models.ControlStatus.WAITING_FOR_SOC
+
+    apply_feature(coordinator, {"battery_soc": 80.0 - const.FEATURE_SOC_HYSTERESIS})
+    assert coordinator.control_status is not models.ControlStatus.WAITING_FOR_SOC
+
+
+def test_automatic_writes_nothing(coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+
+    apply_feature(coordinator, {"battery_soc": 50.0})
+
+    write.assert_not_awaited()
+
+
+def test_power_saving_does_not_take_control_from_the_app(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bit 3 applies like the LED does; only a control method locks the app out."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator._heartbeat_enabled = False
+
+    set_power_saving(coordinator, True)
+
+    assert coordinator.power_saving_commanded is True
+    assert coordinator.heartbeat_enabled is False
+    write.assert_awaited_once_with(
+        address=const.CONTROL_COMMAND_REGISTER,
+        values=[0x0000, 0x0008],
+        device_id=1,
+    )
+
+
+def test_power_saving_keeps_the_control_method_in_the_word(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+
+    set_power_saving(coordinator, True)
+
+    assert write.await_args_list[-1].kwargs["values"] == [0x0000, 0x0038]
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
+
+
+def test_control_command_raises_when_the_device_rejects_it(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch, is_error=True)
+
+    with pytest.raises(coordinator_module.HomeAssistantError):
+        set_power_saving(coordinator, True)
+
+    # The commanded state rolls back, so the UI does not claim a write that failed.
+    assert coordinator.power_saving_commanded is False
+
+
+def test_the_command_is_re_sent_after_a_control_authority_lapse(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lapse makes the device fall back to the app, so the setpoint is gone too."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+    write.reset_mock()
+    coordinator._control_stale = True
+
+    apply_feature(coordinator)
+
+    addresses = [call.kwargs["address"] for call in write.await_args_list]
+    assert addresses == [
+        const.REGISTERS_BY_KEY["battery_power_setpoint"].address,
+        const.CONTROL_COMMAND_REGISTER,
+    ]
+    assert coordinator._control_stale is False
+
+
+def test_a_settled_command_is_not_re_sent_by_polling(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0x0213 reads 0 on a PowerOcean Plus; polling must never second-guess us."""
+    write = allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    select_feature(coordinator, models.ControlFeature.CHARGE_BATTERY)
+    write.reset_mock()
+
+    apply_feature(coordinator)
+
+    assert coordinator.reported_control_method({"system_state_2": 0}) is None
+    write.assert_not_awaited()
+
+
+def test_a_write_failure_during_a_poll_does_not_break_the_read(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(coordinator, monkeypatch)
+    coordinator.data = {"battery_soc": 50.0, "battery_charge_power_limit": 5000.0}
+    coordinator._feature = models.ControlFeature.CHARGE_BATTERY
+    coordinator._client.write_registers = AsyncMock(
+        side_effect=coordinator_module.ModbusException("connection reset")
+    )
+    coordinator._lock = asyncio.Lock()
+
+    asyncio.run(coordinator._async_apply_feature_safe({"battery_soc": 50.0}))
+
+    assert coordinator.selected_feature is models.ControlFeature.CHARGE_BATTERY
 
 
 @pytest.mark.parametrize(
@@ -581,6 +1137,7 @@ def test_gets_and_decodes_raw_data(
     decode_register = Mock(side_effect=(2.0, 42.0))
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_send_heartbeat = AsyncMock(return_value=True)
     coordinator.async_read_block = AsyncMock(return_value=[2, 42])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
 
@@ -609,6 +1166,7 @@ def test_modbus_disabled_recovers_when_telemetry_returns(
     )
     monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
     coordinator._client = SimpleNamespace(connected=True)
+    coordinator.async_send_heartbeat = AsyncMock(return_value=True)
     coordinator.async_read_block = AsyncMock(return_value=[0, 0, 0])
     coordinator.limits[const.CONF_BATTERY_COUNT] = 2
     coordinator.serial_number = "R123456789"
