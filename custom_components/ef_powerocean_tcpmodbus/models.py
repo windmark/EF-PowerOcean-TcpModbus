@@ -94,11 +94,156 @@ class GridMode(StrEnum):
     ISLANDED = "islanded"
 
 
+class ControlMode(StrEnum):
+    """Control method the device follows.
+
+    Commanded through bits 4-7 of the System Control Command (0x0215). The device
+    is also meant to report it back through System State 2 (0x0213), but that
+    register reads zero on a PowerOcean Plus, so it is never read back.
+    """
+
+    DEFAULT = "default"
+    SYSTEM_FEED = "system_feed"
+    INVERTER_FEED = "inverter_feed"
+    BATTERY_LIMITS = "battery_limits"
+
+    @property
+    def command_value(self) -> int:
+        """Return the protocol enumeration value."""
+        return {
+            ControlMode.DEFAULT: 0,
+            ControlMode.SYSTEM_FEED: 1,
+            ControlMode.INVERTER_FEED: 2,
+            ControlMode.BATTERY_LIMITS: 3,
+        }[self]
+
+
+class ControlFeature(StrEnum):
+    """What the user wants the inverter to do.
+
+    The protocol follows a single control method, so these are the options of one
+    select rather than independent toggles.
+    """
+
+    AUTOMATIC = "automatic"
+    HOLD_BATTERY = "hold_battery"
+    CHARGE_BATTERY = "charge_battery"
+    DISCHARGE_BATTERY = "discharge_battery"
+    EXPORT_TO_GRID = "export_to_grid"
+
+
+class ControlStatus(StrEnum):
+    """What the inverter is doing about the selected mode."""
+
+    NO_MODBUS_CONTROL = "no_modbus_control"
+    AUTOMATIC = "automatic"
+    CHARGE_LIMIT_REACHED = "charge_limit_reached"
+    RESERVE_REACHED = "reserve_reached"
+    ACTIVE = "active"
+    RAMPING = "ramping"
+    UNREACHABLE_BATTERY_FULL = "unreachable_battery_full"
+    UNREACHABLE_BATTERY_EMPTY = "unreachable_battery_empty"
+
+
+@dataclass(frozen=True)
+class ControlFeatureDef:
+    """A mode and the single instruction it sends.
+
+    The sign lives here rather than in the user's value, so every power shown and
+    set is a positive magnitude. It also says which guard can block the mode:
+    charging is blocked by the charge limit, discharging by the battery reserve.
+    """
+
+    method: ControlMode
+    # Read key of the setpoint register the method acts on; None for AUTOMATIC.
+    setpoint_key: str | None = None
+    sign: int = 1
+    # Telemetry key holding the quantity this mode pins, in the setpoint's sign
+    # convention. Comparing it against the command is the only way to tell "it is
+    # working" from "the battery has no headroom left".
+    measure_key: str | None = None
+    # Telemetry key holding the device's own ceiling for this mode, if it has one.
+    # Only a ceiling the firmware actually enforces belongs here: the battery charge
+    # and discharge limit registers mirror the EcoFlow app's setting, which Modbus
+    # control overrides, so those modes bound themselves from the configuration.
+    limit_key: str | None = None
+    # Key into the coordinator's configured limits, for a mode the device publishes
+    # no ceiling we can trust for.
+    config_limit_key: str | None = None
+    # None for a mode with no power to configure, which only holds the battery.
+    default_power: float | None = None
+
+    @property
+    def commands_power(self) -> bool:
+        return self.setpoint_key is not None
+
+    @property
+    def has_power(self) -> bool:
+        return self.default_power is not None
+
+    @property
+    def direction(self) -> int:
+        """Return +1 while charging the battery, -1 while draining it, 0 for neither."""
+        return self.sign if self.has_power else 0
+
+
+@dataclass(frozen=True)
+class ControlEntityDef:
+    """An entity that carries commanded state rather than a device register."""
+
+    key: str
+    icon: str | None = None
+    entity_category: EntityCategory | None = None
+
+
+# A commanded setpoint is never met exactly. The inverter reaches a new setpoint
+# within a poll or two, but house load steps instantly and the battery takes a moment
+# to give up the difference: an excursion of nearly half the setpoint was measured on
+# a 2 kW export when a load switched on. Only a wide, sustained miss means anything.
+POWER_TOLERANCE_W: Final = 500.0
+POWER_TOLERANCE_FRACTION: Final = 0.15
+# SOC readings are whole percent, so leave room rather than testing for exactly 100.
+BATTERY_FULL_SOC: Final = 99.0
+BATTERY_EMPTY_MARGIN_SOC: Final = 1.0
+
+
+def deviation_state(
+    *,
+    signed_target: float,
+    measured: float | None,
+    soc: float | None,
+    min_soc: float,
+) -> ControlStatus:
+    """Judge a setpoint that is already commanded against what the system is doing.
+
+    Every control method reaches its target by moving the battery, and the device
+    will not curtail PV to help, so a target is only reachable while the battery
+    has headroom in the direction the error points. A positive error needs the
+    battery to absorb, a negative one needs it to supply.
+    """
+    if measured is None:
+        return ControlStatus.ACTIVE
+
+    error = signed_target - measured
+    tolerance = max(POWER_TOLERANCE_W, abs(signed_target) * POWER_TOLERANCE_FRACTION)
+    if abs(error) <= tolerance:
+        return ControlStatus.ACTIVE
+
+    if soc is not None:
+        if error > 0 and soc >= BATTERY_FULL_SOC:
+            return ControlStatus.UNREACHABLE_BATTERY_FULL
+        if error < 0 and soc <= min_soc + BATTERY_EMPTY_MARGIN_SOC:
+            return ControlStatus.UNREACHABLE_BATTERY_EMPTY
+
+    return ControlStatus.RAMPING
+
+
 class RegisterType(StrEnum):
     """Word layout of a register. Multi-word values are stored low word first."""
 
     UINT16 = "uint16"
     UINT32 = "uint32"
+    INT32 = "int32"
     FLOAT32 = "float32"
     SERIAL = "serial"
 
@@ -106,10 +251,42 @@ class RegisterType(StrEnum):
 REGISTER_SIZES: Final = {
     RegisterType.UINT16: 1,
     RegisterType.UINT32: 2,
+    RegisterType.INT32: 2,
     RegisterType.FLOAT32: 2,
     # 16 ASCII bytes.
     RegisterType.SERIAL: 8,
 }
+
+
+def encode_register(value: int, data_type: RegisterType) -> list[int]:
+    """Return the raw words for writing *value*, HIGH word first.
+
+    Reads and writes disagree on this device. It publishes 32-bit values low word
+    first (see decode_register) but parses multi-register writes high word first:
+    a setpoint of 500 sent low word first is taken as 500 << 16 and the command is
+    ignored, while the same value sent high word first is applied and then
+    re-published low word first. At least on the PowerOcean Plus, this behavior
+    has been observed consistently.
+
+    Raises ValueError when the value does not fit the type or cannot be written.
+    """
+    if data_type is RegisterType.UINT16:
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"{value} does not fit a UINT16 register")
+        return [value]
+
+    if data_type is RegisterType.UINT32:
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f"{value} does not fit a UINT32 register")
+        word = value
+    elif data_type is RegisterType.INT32:
+        if not -0x80000000 <= value <= 0x7FFFFFFF:
+            raise ValueError(f"{value} does not fit an INT32 register")
+        word = value & 0xFFFFFFFF
+    else:
+        raise ValueError(f"Registers of type {data_type} cannot be written")
+
+    return [(word >> 16) & 0xFFFF, word & 0xFFFF]
 
 
 @dataclass(frozen=True)
@@ -236,6 +413,15 @@ class BinarySensorDef:
 
 
 @dataclass(frozen=True)
+class SwitchDef:
+    key: str
+    name: str | None = None
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    icon: str | None = None
+
+
+@dataclass(frozen=True)
 class NumberWritableDef:
     key: str  # Unique key for the number entity (e.g., "min_soc_limit_control")
     read_key: str  # The original key from MODBUS_REGISTERS used for reading (e.g., "min_soc_limit")
@@ -244,6 +430,17 @@ class NumberWritableDef:
     min_value: float  # Slider minimum value
     max_value: float  # Slider maximum value
     step: float  # Step size (1.0 for integers, 0.1 for floats)
+    data_type: RegisterType = RegisterType.UINT16  # Word layout used for the write
     unit: str | None = None  # Unit of measurement
     device_class: str | None = None  # Device class type
     icon: str | None = None  # Custom icon for the slider
+    # Not implemented on every model: hidden from the entity list unless enabled.
+    advanced: bool = False
+    # Models whose firmware stores the write but never acts on it. Writing anyway
+    # would leave the matching sensor reporting a value the device is not using.
+    unsupported_models: tuple[InverterModel, ...] = ()
+
+    @property
+    def size(self) -> int:
+        """Return how many 16-bit words the write occupies."""
+        return REGISTER_SIZES[self.data_type]
