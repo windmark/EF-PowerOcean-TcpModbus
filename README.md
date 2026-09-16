@@ -213,6 +213,17 @@ data:
 
 `revert_to` picks what it falls back to, and defaults to `automatic`. Whichever mode it reverts to uses that mode's own stored power.
 
+Set it to `previous` to restore whatever was selected when the command started, which lets an automation slot in a temporary override without knowing or caring what was running before.
+
+```yaml
+# Export for an hour, then put things back the way they were
+data:
+  mode: export_to_grid
+  power: 5000
+  duration: "01:00:00"
+  revert_to: previous
+```
+
 ### Fields
 
 | Field                 | Type         | Notes                                                                                |
@@ -224,7 +235,7 @@ data:
 | `duration`            | `"HH:MM:SS"` | Capped at 24 hours                                                                    |
 | `until`               | HA condition | Ends the command once it becomes true                                                 |
 | `until_mode`          | `any`, `all` | Default `any`                                                                         |
-| `revert_to`           | mode         | Default `automatic`                                                                   |
+| `revert_to`           | mode         | Or `previous` to restore what was selected before. Default `automatic`                |
 
 ### Things worth knowing
 
@@ -235,6 +246,56 @@ data:
 - **An `until` entity that goes `unavailable` counts as "not yet"**, so the command keeps running. This is why `until_mode: all` insists on a `duration`: without one, an unavailable sensor could hold the mode indefinitely.
 - **A failed revert is retried** on the next poll instead of being dropped.
 - **`revert_at`** shows up as an attribute on the Battery Mode select while a timed command is running, so a dashboard or another automation can see it and stay out of the way.
+
+### Chaining commands together
+
+When a timed command ends, the integration fires an `ef_powerocean_tcpmodbus_command_ended` event, so one command can pick up where another left off.
+
+| Event data    | Meaning                                                           |
+| ------------- | ----------------------------------------------------------------- |
+| `entity_id`   | The Battery Mode select the command belonged to                   |
+| `device_id`   | The inverter it ran on, stable across renames                     |
+| `mode`        | The mode that just ended                                          |
+| `now_in_mode` | The mode now in force                                             |
+| `result`      | `completed` if it got where it was going, `expired` if it gave up |
+
+`result` is the one to branch on. A command with an `until` that came true `completed`. One that hit its `duration` first, with the `until` still not true, `expired`. A command with only a `duration` and nothing to wait for always `completed`, because running its time out was the whole point.
+
+Every value is a plain string, so a trigger can filter on them directly and you never need a template:
+
+```yaml
+automation:
+  - alias: Export once the battery is full
+    triggers:
+      - trigger: event
+        event_type: ef_powerocean_tcpmodbus_command_ended
+        event_data:
+          mode: charge_battery
+          result: completed
+    actions:
+      - action: ef_powerocean_tcpmodbus.set_control
+        target:
+          entity_id: "{{ trigger.event.data.entity_id }}"
+        data:
+          mode: export_to_grid
+          power: 5000
+          duration: "02:00:00"
+```
+
+That reads as "once a charge command reaches its target, export for two hours". Had the charge simply run out of time without reaching 80%, `result` would be `expired` and the automation would not fire, which is what you want: there is nothing to export.
+
+The event fires after the revert has been written, so by the time the automation runs the inverter is already in the mode `now_in_mode` names.
+
+The event type is the same for every inverter. If you have more than one and want an automation to react to just the one, filter on `device_id`, which stays put even if you rename the device:
+
+```yaml
+    triggers:
+      - trigger: event
+        event_type: ef_powerocean_tcpmodbus_command_ended
+        event_data:
+          device_id: 1f4e9c2a7b3d84e6fa05c1938d72be40
+          result: completed
+```
 
 ### In an automation
 

@@ -667,6 +667,18 @@ UNTIL_MODE_ANY: Final = "any"
 UNTIL_MODE_ALL: Final = "all"
 UNTIL_MODES: Final = (UNTIL_MODE_ANY, UNTIL_MODE_ALL)
 
+# revert_to: whatever was selected when the window opened, rather than a fixed mode.
+REVERT_TO_PREVIOUS: Final = "previous"
+
+# Fired when a timed command ends, so one can be chained onto another. The result
+# is what an automation branches on: a command with an until that never came true
+# gave up, and should not be treated as having got where it was going.
+EVENT_COMMAND_ENDED: Final = f"{DOMAIN}_command_ended"
+RESULT_COMPLETED: Final = "completed"
+RESULT_EXPIRED: Final = "expired"
+REVERT_REASON_DURATION: Final = "duration"
+REVERT_REASON_CONDITION: Final = "condition"
+
 # A command is an override, not a schedule.
 REVERT_MAX_DURATION_S: Final = 24 * 60 * 60
 

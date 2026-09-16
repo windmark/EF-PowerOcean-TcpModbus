@@ -457,7 +457,7 @@
         },
         "revert_to": {
           "name": "Zurücksetzen auf",
-          "description": "Modus, auf den nach Ende des Befehls zurückgesetzt wird. Standard ist Automatik."
+          "description": "Modus, auf den nach Ende des Befehls zurückgesetzt wird. Mit 'previous' wird der Modus wiederhergestellt, der beim Start des Befehls ausgewählt war. Standard ist Automatik."
         }
       }
     }

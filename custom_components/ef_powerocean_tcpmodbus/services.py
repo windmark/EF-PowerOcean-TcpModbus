@@ -33,7 +33,13 @@ from .const import (
     ATTR_REVERT_TO,
     ATTR_UNTIL,
     ATTR_UNTIL_MODE,
+    EVENT_COMMAND_ENDED,
+    RESULT_COMPLETED,
+    RESULT_EXPIRED,
     REVERT_MAX_DURATION_S,
+    REVERT_REASON_CONDITION,
+    REVERT_REASON_DURATION,
+    REVERT_TO_PREVIOUS,
     UNTIL_MODE_ALL,
     UNTIL_MODE_ANY,
     UNTIL_MODES,
@@ -61,7 +67,7 @@ SET_CONTROL_SCHEMA: dict[Any, Any] = {
     vol.Optional(ATTR_UNTIL): cv.CONDITION_SCHEMA,
     vol.Optional(ATTR_UNTIL_MODE, default=UNTIL_MODE_ANY): vol.In(UNTIL_MODES),
     vol.Optional(ATTR_REVERT_TO, default=str(ControlFeature.AUTOMATIC)): vol.In(
-        FEATURE_OPTIONS
+        [*FEATURE_OPTIONS, REVERT_TO_PREVIOUS]
     ),
 }
 
@@ -78,6 +84,9 @@ class PendingRevert:
         self,
         coordinator: EcoflowCoordinator,
         *,
+        entity_id: str,
+        device_id: str | None,
+        commanded: ControlFeature,
         deadline: datetime | None,
         until_config: dict[str, Any] | None,
         until_mode: str,
@@ -86,6 +95,9 @@ class PendingRevert:
         self._hass = coordinator.hass
         self._coordinator = coordinator
         self._control = coordinator.control
+        self._entity_id = entity_id
+        self._device_id = device_id
+        self._commanded = commanded
         self._deadline = deadline
         self._until_config = until_config
         self._until_mode = until_mode
@@ -106,16 +118,27 @@ class PendingRevert:
                 self._hass, self._until_config
             )
 
+    @property
+    def _term_count(self) -> int:
+        return (self._deadline is not None) + (self._until_config is not None)
+
+    async def async_reasons(self) -> list[str]:
+        """Return which of the window's terms are true right now."""
+        reasons: list[str] = []
+        if self._deadline is not None and dt_util.utcnow() >= self._deadline:
+            reasons.append(REVERT_REASON_DURATION)
+        if self._checker is not None and await self._async_condition_holds():
+            reasons.append(REVERT_REASON_CONDITION)
+        return reasons
+
     async def async_satisfied(self) -> bool:
         """Return whether the command should now be given up."""
-        terms: list[bool] = []
-        if self._deadline is not None:
-            terms.append(dt_util.utcnow() >= self._deadline)
-        if self._checker is not None:
-            terms.append(await self._async_condition_holds())
-        if not terms:
-            return False
-        return any(terms) if self._until_mode == UNTIL_MODE_ANY else all(terms)
+        return self._satisfied_by(await self.async_reasons())
+
+    def _satisfied_by(self, reasons: list[str]) -> bool:
+        if self._until_mode == UNTIL_MODE_ANY:
+            return bool(reasons)
+        return len(reasons) == self._term_count
 
     async def _async_condition_holds(self) -> bool:
         """Evaluate the user's condition, treating an error as 'not yet'.
@@ -160,7 +183,10 @@ class PendingRevert:
         self._hass.async_create_task(self._async_reevaluate())
 
     async def _async_reevaluate(self) -> None:
-        if self._reverted or not await self.async_satisfied():
+        if self._reverted:
+            return
+        reasons = await self.async_reasons()
+        if not self._satisfied_by(reasons):
             return
 
         # Set before commanding, so the revert does not supersede itself.
@@ -175,8 +201,30 @@ class PendingRevert:
             )
             return
 
-        _LOGGER.debug(f"Timed command ended; reverted to {self._revert_to}")
         self.cancel()
+        result = self._result(reasons)
+        # Fired after the write lands, so an automation chaining onto it finds the
+        # inverter already in the mode the event names. Every value is a plain
+        # string, so a trigger can match on event_data without a template.
+        self._hass.bus.async_fire(
+            EVENT_COMMAND_ENDED,
+            {
+                "entity_id": self._entity_id,
+                "device_id": self._device_id,
+                "mode": str(self._commanded),
+                "now_in_mode": str(self._revert_to),
+                "result": result,
+            },
+        )
+        _LOGGER.debug(
+            f"Timed command {self._commanded} {result}; reverted to {self._revert_to}"
+        )
+
+    def _result(self, reasons: list[str]) -> str:
+        """Say whether the window got where it was going, or just ran out of time."""
+        if self._until_config is None or REVERT_REASON_CONDITION in reasons:
+            return RESULT_COMPLETED
+        return RESULT_EXPIRED
 
     @callback
     def cancel(self) -> None:
@@ -211,7 +259,7 @@ def _validate(
 
     if mode == revert_to and (duration is not None or until is not None):
         _LOGGER.warning(
-            f"revert_to is the same mode as mode ({mode}), so the window will end by "
+            f"The window reverts to {mode}, the mode it commands, so it will end by "
             "re-sending the command it started with."
         )
 
@@ -231,22 +279,32 @@ async def async_set_control_service(
     """Command the inverter, and arrange for the command to end if asked."""
     coordinator = entity.coordinator
 
+    # Resolved before the command lands, while the mode it replaces is still selected.
+    revert_feature = (
+        coordinator.control.selected_feature
+        if revert_to == REVERT_TO_PREVIOUS
+        else ControlFeature(revert_to)
+    )
+
     _validate(
         mode=mode,
         duration=duration,
         until=until,
         until_mode=until_mode,
-        revert_to=revert_to,
+        revert_to=str(revert_feature),
     )
 
     pending: PendingRevert | None = None
     if duration is not None or until is not None:
         pending = PendingRevert(
             coordinator,
+            entity_id=entity.entity_id,
+            device_id=entity.device_entry.id if entity.device_entry else None,
+            commanded=ControlFeature(mode),
             deadline=(dt_util.utcnow() + duration) if duration is not None else None,
             until_config=until,
             until_mode=until_mode,
-            revert_to=ControlFeature(revert_to),
+            revert_to=revert_feature,
         )
         try:
             await pending.async_prepare()

@@ -446,7 +446,7 @@
         },
         "revert_to": {
           "name": "Revert to",
-          "description": "Mode to fall back to when the command ends. Defaults to Automatic."
+          "description": "Mode to fall back to when the command ends. Use 'previous' to restore whatever was selected when the command started. Defaults to Automatic."
         }
       }
     }

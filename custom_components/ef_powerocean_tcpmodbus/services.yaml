@@ -68,3 +68,4 @@ set_control:
             - charge_battery
             - discharge_battery
             - export_to_grid
+            - previous
