@@ -56,6 +56,9 @@ homeassistant_exceptions = types.ModuleType("homeassistant.exceptions")
 homeassistant_exceptions.HomeAssistantError = type(
     "HomeAssistantError", (Exception,), {}
 )
+homeassistant_exceptions.ServiceValidationError = type(
+    "ServiceValidationError", (homeassistant_exceptions.HomeAssistantError,), {}
+)
 homeassistant_persistent_notification = types.ModuleType(
     "homeassistant.components.persistent_notification"
 )

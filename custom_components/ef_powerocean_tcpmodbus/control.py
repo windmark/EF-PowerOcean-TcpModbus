@@ -7,12 +7,13 @@ and nothing reaches the wire unless the inverter is currently following us.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import dt
 
 from .const import (
@@ -106,6 +107,7 @@ class ControlManager:
         self._deviation_polls = 0
         # The last frame read, so a ceiling can be quoted between polls.
         self._data: dict[str, Any] = {}
+        self._superseded_listeners: list[Callable[[], None]] = []
 
     @property
     def enabled(self) -> bool:
@@ -294,10 +296,61 @@ class ControlManager:
                 "rejected, so the inverter would ignore the command. Nothing written."
             )
 
+    def call_when_superseded(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Call *listener* once the command in force is replaced, and return an unsubscribe.
+
+        A guard stepping in does not supersede anything: the same command is still
+        being honoured.
+        """
+        self._superseded_listeners.append(listener)
+
+        def _remove() -> None:
+            with contextlib.suppress(ValueError):
+                self._superseded_listeners.remove(listener)
+
+        return _remove
+
+    def _notify_superseded(self) -> None:
+        # Copied, because a listener unsubscribing itself mutates the list.
+        for listener in list(self._superseded_listeners):
+            listener()
+
     async def async_select_feature(self, feature: ControlFeature) -> None:
-        """Select a control feature."""
+        """Select a control feature, leaving its power and the guards as they are."""
+        await self.async_set_control(feature)
+
+    async def async_set_control(
+        self,
+        feature: ControlFeature,
+        *,
+        power: float | None = None,
+        charge_limit_soc: float | None = None,
+        battery_reserve_soc: float | None = None,
+    ) -> None:
+        """Set a mode and its parameters together, as one command on the wire.
+
+        Selecting a mode and then setting its power is two writes, and the first
+        carries whatever power that mode was last given.
+        """
         if feature is not ControlFeature.AUTOMATIC:
             self._require_modbus_control()
+
+        if power is not None and not CONTROL_FEATURES[feature].has_power:
+            raise ServiceValidationError(
+                f"{feature} takes no power setpoint; omit power or choose a mode "
+                "that commands one."
+            )
+
+        self._notify_superseded()
+
+        if power is not None:
+            self._feature_power[feature] = self._clamp_power(power, feature)
+        if charge_limit_soc is not None:
+            self._charge_limit_soc = max(0.0, min(100.0, charge_limit_soc))
+            self._charge_guard = False
+        if battery_reserve_soc is not None:
+            self._battery_reserve_soc = max(0.0, min(100.0, battery_reserve_soc))
+            self._reserve_guard = False
 
         self._feature = feature
         await self.async_apply(force=True)

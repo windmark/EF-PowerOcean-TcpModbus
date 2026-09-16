@@ -410,5 +410,45 @@
         "name": "Battery Saver Mode"
       }
     }
+  },
+  "services": {
+    "set_control": {
+      "name": "Set control",
+      "description": "Command the inverter in one step, optionally only until a time and/or a condition is met.",
+      "fields": {
+        "mode": {
+          "name": "Mode",
+          "description": "What the inverter should do."
+        },
+        "power": {
+          "name": "Power",
+          "description": "Power for this mode, in watts. Clamped to the inverter's ceiling. Not accepted by Automatic or Hold battery."
+        },
+        "charge_limit_soc": {
+          "name": "Charge limit SOC",
+          "description": "State of charge above which the battery must not be charged. 100 disables the guard."
+        },
+        "battery_reserve_soc": {
+          "name": "Battery reserve SOC",
+          "description": "State of charge below which the battery must not be drained. 0 disables the guard."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "How long to hold this mode before reverting. Capped at 24 hours."
+        },
+        "until": {
+          "name": "Until",
+          "description": "A Home Assistant condition that ends the command when it becomes true. Any condition valid in an automation works here, nesting included."
+        },
+        "until_mode": {
+          "name": "Until mode",
+          "description": "With 'any', whichever of duration and until comes first ends the command. With 'all', both must hold, and both must be supplied."
+        },
+        "revert_to": {
+          "name": "Revert to",
+          "description": "Mode to fall back to when the command ends. Defaults to Automatic."
+        }
+      }
+    }
   }
 }

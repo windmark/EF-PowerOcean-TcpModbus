@@ -15,6 +15,7 @@
 - **Configurable poll interval** (2–30 seconds, default 5 s)
 - Real-time power flow: house consumption, grid import/export, solar generation, battery
 - Optional **Battery Controls**: charge, discharge, export or hold, with state-of-charge guards
+- **`set_control` service** for automations: sets a mode and its power in one call, optionally only for a duration and/or until a condition on any entity is met
 - Full battery monitoring: SOC, voltage, current, power, temperature, remaining energy
 - Per-module state of charge for up to 12 battery modules
 - Per-string PV power, current and voltage (1–3 strings)
@@ -144,6 +145,127 @@ On the device page the two are deliberately kept apart:
 
 Each mode's power stays editable while another mode is selected, so a command can be
 set up before it is needed. Only the selected mode's value is ever sent.
+
+---
+
+## Automating: the `set_control` service
+
+You can drive all the entities above from an automation already, but setting a mode and its power takes two calls, and the first one sends whatever power that mode was last given before the second one corrects it. `ef_powerocean_tcpmodbus.set_control` sets everything in one go, so the inverter only ever hears the finished intent. It can also hold that command for a while and then let go.
+
+```yaml
+action: ef_powerocean_tcpmodbus.set_control
+target:
+  entity_id: select.ecoflow_powerocean_battery_mode
+data:
+  mode: charge_battery
+  power: 3000
+```
+
+### Letting the command end by itself
+
+Pass a `duration`, an `until` condition, or both.
+
+```yaml
+# Two hours, then back to Automatic
+data:
+  mode: charge_battery
+  power: 3000
+  duration: "02:00:00"
+```
+
+```yaml
+# Until the battery reaches 80%
+data:
+  mode: charge_battery
+  power: 3000
+  until:
+    condition: numeric_state
+    entity_id: sensor.ecoflow_powerocean_battery_soc
+    above: 79
+```
+
+`until` takes Home Assistant's own condition config, so anything you can write in an automation works here: `numeric_state`, `state`, `template`, `for:`, and nested `and` / `or` / `not`.
+
+```yaml
+# Export while the price is high and the battery is above 40%,
+# and give up after four hours either way
+data:
+  mode: export_to_grid
+  power: 5000
+  duration: "04:00:00"
+  until:
+    condition: or
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.electricity_price
+        below: 0.25
+      - condition: numeric_state
+        entity_id: sensor.ecoflow_powerocean_battery_soc
+        below: 40
+```
+
+`until_mode` decides how `duration` and `until` combine:
+
+| `until_mode`    | Behaviour                                                       |
+| --------------- | --------------------------------------------------------------- |
+| `any` (default) | Whichever comes first ends the command                          |
+| `all`           | Both must hold. Requires **both** `duration` and `until` be set |
+
+`revert_to` picks what it falls back to, and defaults to `automatic`. Whichever mode it reverts to uses that mode's own stored power.
+
+### Fields
+
+| Field                 | Type         | Notes                                                                                |
+| --------------------- | ------------ | ------------------------------------------------------------------------------------ |
+| `mode`                | required     | `automatic`, `hold_battery`, `charge_battery`, `discharge_battery`, `export_to_grid`  |
+| `power`               | watts        | Clamped to the inverter's ceiling. Rejected for modes that have no setpoint           |
+| `charge_limit_soc`    | 0-100        | Sets the Charge Limit guard in the same call                                          |
+| `battery_reserve_soc` | 0-100        | Sets the Battery Reserve guard in the same call                                       |
+| `duration`            | `"HH:MM:SS"` | Capped at 24 hours                                                                    |
+| `until`               | HA condition | Ends the command once it becomes true                                                 |
+| `until_mode`          | `any`, `all` | Default `any`                                                                         |
+| `revert_to`           | mode         | Default `automatic`                                                                   |
+
+### Things worth knowing
+
+- **Nothing happens if the end condition is already true.** Asking to charge until 80% when the battery is at 85% sends no command at all, rather than entering the mode and unwinding it a moment later. It gets logged at info level.
+- **Any new intent cancels a running window.** Picking a mode from the Battery Mode select, or making a second `set_control` call, drops the pending revert, so an override you thought you had replaced will not come back to bite you later.
+- **Guards do not cancel it.** Hitting the Charge Limit means the command is being honoured, not changed, so the window keeps running.
+- **A window never survives a restart.** The selected mode is deliberately not restored across restarts, so there is nothing left to revert to. And if Home Assistant stops while a command is being held, the heartbeat lapses and the inverter hands control back to the app on its own. That is the real safety net under all of this.
+- **An `until` entity that goes `unavailable` counts as "not yet"**, so the command keeps running. This is why `until_mode: all` insists on a `duration`: without one, an unavailable sensor could hold the mode indefinitely.
+- **A failed revert is retried** on the next poll instead of being dropped.
+- **`revert_at`** shows up as an attribute on the Battery Mode select while a timed command is running, so a dashboard or another automation can see it and stay out of the way.
+
+### In an automation
+
+```yaml
+automation:
+  - alias: Charge on cheap power
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.electricity_price
+        below: 0.10
+    conditions:
+      - condition: numeric_state
+        entity_id: sensor.ecoflow_powerocean_battery_soc
+        below: 70
+    actions:
+      - action: ef_powerocean_tcpmodbus.set_control
+        target:
+          entity_id: select.ecoflow_powerocean_battery_mode
+        data:
+          mode: charge_battery
+          power: 3000
+          duration: "03:00:00"
+          until:
+            condition: numeric_state
+            entity_id: sensor.ecoflow_powerocean_battery_soc
+            above: 79
+```
+
+Keep `mode: single` on it. Price sensors update often, and an automation that retriggers will fight the integration's own 60 second minimum dwell between commands.
 
 ---
 

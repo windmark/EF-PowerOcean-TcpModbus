@@ -421,5 +421,45 @@
         "name": "Batteriesparmodus"
       }
     }
+  },
+  "services": {
+    "set_control": {
+      "name": "Steuerung setzen",
+      "description": "Den Wechselrichter in einem Schritt steuern, optional nur bis zu einem Zeitpunkt und/oder bis eine Bedingung erfüllt ist.",
+      "fields": {
+        "mode": {
+          "name": "Modus",
+          "description": "Was der Wechselrichter tun soll."
+        },
+        "power": {
+          "name": "Leistung",
+          "description": "Leistung für diesen Modus in Watt. Wird auf die Obergrenze des Wechselrichters begrenzt. Von Automatik und Batterie halten nicht akzeptiert."
+        },
+        "charge_limit_soc": {
+          "name": "Ladegrenze SOC",
+          "description": "Ladezustand, oberhalb dessen die Batterie nicht geladen werden darf. 100 deaktiviert die Grenze."
+        },
+        "battery_reserve_soc": {
+          "name": "Reserve SOC",
+          "description": "Ladezustand, unterhalb dessen die Batterie nicht entladen werden darf. 0 deaktiviert die Grenze."
+        },
+        "duration": {
+          "name": "Dauer",
+          "description": "Wie lange dieser Modus gehalten wird, bevor zurückgesetzt wird. Maximal 24 Stunden."
+        },
+        "until": {
+          "name": "Bis",
+          "description": "Eine Home-Assistant-Bedingung, die den Befehl beendet, sobald sie zutrifft. Jede in einer Automatisierung gültige Bedingung funktioniert hier, auch verschachtelt."
+        },
+        "until_mode": {
+          "name": "Bis-Modus",
+          "description": "Bei 'any' beendet das zuerst eintretende von Dauer und Bedingung den Befehl. Bei 'all' müssen beide zutreffen und beide angegeben sein."
+        },
+        "revert_to": {
+          "name": "Zurücksetzen auf",
+          "description": "Modus, auf den nach Ende des Befehls zurückgesetzt wird. Standard ist Automatik."
+        }
+      }
+    }
   }
 }

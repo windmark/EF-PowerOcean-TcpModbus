@@ -651,6 +651,25 @@ CONTROL_STATUS_DAMPING_POLLS: Final = 3
 # 0 means "no limit" to the inverter and not "hold at zero", so we therefore set the lowest power to hold.
 HOLD_SETPOINT_W: Final = 1.0
 
+# The set_control service: one command, optionally held until a deadline and/or a
+# condition on another entity.
+SERVICE_SET_CONTROL: Final = "set_control"
+ATTR_MODE: Final = "mode"
+ATTR_POWER: Final = "power"
+ATTR_CHARGE_LIMIT_SOC: Final = "charge_limit_soc"
+ATTR_BATTERY_RESERVE_SOC: Final = "battery_reserve_soc"
+ATTR_DURATION: Final = "duration"
+ATTR_UNTIL: Final = "until"
+ATTR_UNTIL_MODE: Final = "until_mode"
+ATTR_REVERT_TO: Final = "revert_to"
+
+UNTIL_MODE_ANY: Final = "any"
+UNTIL_MODE_ALL: Final = "all"
+UNTIL_MODES: Final = (UNTIL_MODE_ANY, UNTIL_MODE_ALL)
+
+# A command is an override, not a schedule.
+REVERT_MAX_DURATION_S: Final = 24 * 60 * 60
+
 # Not a device register: whether the selected mode is doing anything, and why not.
 CONTROL_STATUS_SENSOR: Final = SensorDef(
     key="control_status",

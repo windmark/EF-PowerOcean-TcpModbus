@@ -1,0 +1,70 @@
+set_control:
+  target:
+    entity:
+      integration: ef_powerocean_tcpmodbus
+      domain: select
+  fields:
+    mode:
+      required: true
+      example: charge_battery
+      selector:
+        select:
+          options:
+            - automatic
+            - hold_battery
+            - charge_battery
+            - discharge_battery
+            - export_to_grid
+    power:
+      example: 3000
+      selector:
+        number:
+          min: 0
+          max: 20000
+          step: 100
+          unit_of_measurement: W
+          mode: box
+    charge_limit_soc:
+      example: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+    battery_reserve_soc:
+      example: 20
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+    duration:
+      example: "02:00:00"
+      selector:
+        duration:
+    until:
+      example: |
+        condition: numeric_state
+        entity_id: sensor.powerocean_battery_soc
+        above: 79
+      selector:
+        object:
+    until_mode:
+      default: any
+      selector:
+        select:
+          options:
+            - any
+            - all
+    revert_to:
+      default: automatic
+      selector:
+        select:
+          options:
+            - automatic
+            - hold_battery
+            - charge_battery
+            - discharge_battery
+            - export_to_grid

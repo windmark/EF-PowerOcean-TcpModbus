@@ -482,3 +482,73 @@ def test_the_parameters_survive_a_restart_but_the_selected_mode_does_not(
     assert control.charge_limit_soc == 80.0
     assert control.battery_saver_commanded is True
     assert control.selected_feature is Feature.AUTOMATIC
+
+
+def test_setting_a_mode_and_its_power_together_sends_one_command(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting first would put the mode's previous power on the wire."""
+    write = allow_writes(control, monkeypatch)
+    control._feature_power[Feature.CHARGE_BATTERY] = 500.0
+
+    asyncio.run(control.async_set_control(Feature.CHARGE_BATTERY, power=3000.0))
+
+    setpoints = [
+        words
+        for address, words in commands(write)
+        if address != const.CONTROL_COMMAND_REGISTER
+    ]
+    assert len(setpoints) == 1
+    assert setpoints[0] == models.encode_register(3000, models.RegisterType.INT32)
+    assert control.power == 3000.0
+
+
+def test_a_power_is_refused_for_a_mode_that_commands_none(control) -> None:
+    """Silently dropping it would leave the user thinking it had been applied."""
+    with pytest.raises(control_module.ServiceValidationError):
+        asyncio.run(control.async_set_control(Feature.AUTOMATIC, power=3000.0))
+
+
+def test_changing_the_mode_from_anywhere_supersedes_a_running_window(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed command must not outlive the user picking a mode by hand."""
+    allow_writes(control, monkeypatch)
+    cancelled = Mock()
+    control.call_when_superseded(cancelled)
+
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    assert cancelled.call_count == 1
+
+    asyncio.run(control.async_set_control(Feature.DISCHARGE_BATTERY, power=1000.0))
+    assert cancelled.call_count == 2
+
+
+def test_a_guard_stepping_in_does_not_supersede_the_command(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hitting the charge ceiling is the command working, not the user changing it."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_control(Feature.CHARGE_BATTERY, power=2000.0))
+
+    cancelled = Mock()
+    control.call_when_superseded(cancelled)
+    control._charge_limit_soc = 80.0
+    asyncio.run(control.async_apply({"battery_soc": 85.0}))
+
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    cancelled.assert_not_called()
+
+
+def test_an_unsubscribed_listener_stops_being_called(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window that has already ended must not be torn down twice."""
+    allow_writes(control, monkeypatch)
+    cancelled = Mock()
+    remove = control.call_when_superseded(cancelled)
+    remove()
+    remove()
+
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    cancelled.assert_not_called()
