@@ -53,6 +53,25 @@ class InverterModel(StrEnum):
         }[self]
 
     @property
+    def reads_high_word_first(self) -> bool:
+        """Whether the device publishes 32-bit values high word first.
+
+        Every other model publishes them low word first. Reading the three-phase
+        Ocean 2 that way leaves the low word empty, which turns its 10 kW rating
+        into 655360000 and its voltages into denormals that round to zero.
+        """
+        return self is InverterModel.OCEAN_2
+
+    @property
+    def max_register_gap(self) -> int:
+        """How far apart two registers may be and still share one read.
+
+        The three-phase Ocean 2 refuses the whole request when it reaches over an
+        address it does not implement, so only neighbours can be read together.
+        """
+        return 0 if self is InverterModel.OCEAN_2 else MAX_REGISTER_GAP
+
+    @property
     def display_name(self) -> str:
         return {
             self.POWEROCEAN_SINGLE_PHASE: "PowerOcean Single Phase",
@@ -81,6 +100,10 @@ class InverterModel(StrEnum):
             return cls.POWEROCEAN_SINGLE_PHASE
         if product_number == 3:
             return cls.POWEROCEAN_PLUS
+        # Only the three-phase Ocean 2 reports 4; the single-phase one reports 2
+        # and speaks the same dialect as the PowerOcean single phase.
+        if product_number == 4:
+            return cls.OCEAN_2
         return None
 
 
@@ -339,7 +362,9 @@ class RegisterBlock:
         return list(raw[index : index + register.size])
 
 
-def plan_blocks(registers: Iterable[RegisterDef]) -> tuple[RegisterBlock, ...]:
+def plan_blocks(
+    registers: Iterable[RegisterDef], max_gap: int = MAX_REGISTER_GAP
+) -> tuple[RegisterBlock, ...]:
     """Group registers into the fewest Modbus reads.
 
     A new read starts when the next register is too far away to be worth reading
@@ -352,7 +377,7 @@ def plan_blocks(registers: Iterable[RegisterDef]) -> tuple[RegisterBlock, ...]:
         if current:
             gap = register.address - max(mapped.end for mapped in current)
             span = register.end - current[0].address
-            if gap > MAX_REGISTER_GAP or span > MAX_REGISTERS_PER_READ:
+            if gap > max_gap or span > MAX_REGISTERS_PER_READ:
                 blocks.append(RegisterBlock(tuple(current)))
                 current = []
         current.append(register)
@@ -366,7 +391,10 @@ def plan_blocks_for_model(
     registers: Iterable[RegisterDef], inverter_model: InverterModel
 ) -> tuple[RegisterBlock, ...]:
     """Resolve model-specific addresses and group them into Modbus reads."""
-    return plan_blocks(register.for_model(inverter_model) for register in registers)
+    return plan_blocks(
+        (register.for_model(inverter_model) for register in registers),
+        max_gap=inverter_model.max_register_gap,
+    )
 
 
 @dataclass(frozen=True)

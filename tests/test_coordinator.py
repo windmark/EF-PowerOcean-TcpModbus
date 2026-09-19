@@ -34,6 +34,7 @@ def coordinator():
     instance._consecutive_modbus_disabled_reads = 0
     instance._ena_calc_solar_power = False
     instance.inverter_model = const.DEFAULT_INVERTER_MODEL
+    instance.detected_model = None
     instance._register_blocks = const.register_blocks_for(instance.inverter_model)
     instance._registers_by_key = {
         register.key: register
@@ -831,6 +832,21 @@ def test_reads_device_info_in_a_single_request(coordinator) -> None:
     coordinator._modbus_client.async_read.assert_awaited_once_with(40002, 12)
 
 
+def test_reads_device_info_of_a_three_phase_ocean_2(coordinator) -> None:
+    """It reports product number 4 and sends 32-bit values high word first."""
+    registers = _device_info_registers(product_number=4, product_category=1)
+    firmware_index = const.DEVICE_INFO_BLOCK.index_of(const.FIRMWARE_VERSION)
+    registers[firmware_index], registers[firmware_index + 1] = 0x0100, 0x034F
+    coordinator.firmware_version = None
+    coordinator.detected_model = None
+    coordinator._modbus_client.async_read = AsyncMock(return_value=registers)
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.detected_model == models.InverterModel.OCEAN_2
+    assert coordinator.firmware_version == "1.0.3.79"
+
+
 def test_device_info_read_failure_closes_connection(coordinator) -> None:
     coordinator.firmware_version = None
     coordinator.detected_model = None
@@ -855,11 +871,26 @@ def test_read_plan_is_not_split_more_than_necessary(
         merged = following.start + following.count - block.start
 
         assert (
-            gap > models.MAX_REGISTER_GAP or merged > models.MAX_REGISTERS_PER_READ
+            gap > inverter_model.max_register_gap
+            or merged > models.MAX_REGISTERS_PER_READ
         ), (
             f"blocks at {block.start} and {following.start} are only {gap} words "
             f"apart and would merge into {merged} words, so they should be one read"
         )
+
+
+def test_ocean_2_reads_stop_at_every_unmapped_address() -> None:
+    """It refuses a request that reaches over an address it does not implement."""
+    blocks = const.register_blocks_for(models.InverterModel.OCEAN_2)
+    mapped = {
+        address
+        for block in blocks
+        for register in block.registers
+        for address in range(register.address, register.end)
+    }
+
+    for block in blocks:
+        assert set(range(block.start, block.start + block.count)) <= mapped
 
 
 def test_block_rejects_more_registers_than_a_modbus_read_allows() -> None:
@@ -879,6 +910,7 @@ def test_block_rejects_more_registers_than_a_modbus_read_allows() -> None:
         (1, 2, models.InverterModel.POWEROCEAN_SINGLE_PHASE),
         (2, 2, models.InverterModel.POWEROCEAN_SINGLE_PHASE),
         (3, 1, models.InverterModel.POWEROCEAN_PLUS),
+        (4, 1, models.InverterModel.OCEAN_2),
         (0, 1, None),
         (None, None, None),
     ),
