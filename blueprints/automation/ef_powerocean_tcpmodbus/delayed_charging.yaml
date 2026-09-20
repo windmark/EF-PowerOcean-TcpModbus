@@ -1,0 +1,264 @@
+blueprint:
+  name: Delayed battery charging for feed-in clipping
+  description: >
+    Holds the battery back in the morning so that the energy your feed-in limit
+    would otherwise curtail at midday goes into storage instead.
+
+
+    Without this, a battery with a few kWh of room fills from the first surplus
+    of the day and is full long before production reaches the export ceiling.
+    Everything above the ceiling from then on is curtailed at the panels and
+    lost. This automation keeps that room until it is worth something.
+
+
+    It writes one entity, the Charge Limit guard, and never changes the mode.
+    The inverter stays in Automatic doing self-consumption and MPPT, which it
+    does better than any automation.
+
+
+    Every reading it needs is published as an attribute of the Battery Mode
+    entity, so there is nothing to discover and nothing that breaks if you
+    rename an entity.
+
+  domain: automation
+  source_url: https://github.com/windmark/EF-PowerOcean-TcpModbus/blob/main/blueprints/automation/ef_powerocean_tcpmodbus/delayed_charging.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+
+  input:
+    core:
+      name: Required
+      icon: mdi:cog
+      input:
+        battery_mode_select:
+          name: Battery Mode
+          description: >
+            The Battery Mode select from your PowerOcean device. Everything the
+            automation reads comes from this entity's attributes: control
+            status, battery SoC, grid power, feed-in limit and pack capacity.
+          selector:
+            entity:
+              filter:
+                - integration: ef_powerocean_tcpmodbus
+                  domain: select
+
+        charge_limit_number:
+          name: Charge Limit
+          description: >
+            The Charge Limit guard on the same device. The only entity this
+            automation writes.
+          selector:
+            entity:
+              filter:
+                - integration: ef_powerocean_tcpmodbus
+                  domain: number
+
+        solcast_peak_sensor:
+          name: Solcast peak forecast today
+          description: >
+            Peak Forecast Today from the Solcast PV Forecast integration, in W.
+          selector:
+            entity:
+              domain: sensor
+
+    tuning:
+      name: Tuning
+      icon: mdi:tune
+      collapsed: true
+      input:
+        peak_margin:
+          name: Peak margin
+          description: >
+            How far above the forecast peak a real day is assumed to reach.
+
+
+            Solcast reports half-hourly MEANS. A true instantaneous peak is
+            always above the 30-minute average containing it, and on broken
+            cloud days output can swing several kW inside a single period.
+            Cloud-edge enhancement adds more. None of this is forecast error —
+            it is a resolution mismatch, and only slack covers it.
+
+
+            Bias this high. A false positive costs nothing: the battery waits,
+            nothing clips, the release time arrives and it still fills by
+            evening. A false negative costs the whole day's clipping.
+          default: 1.3
+          selector:
+            number:
+              min: 1.0
+              max: 2.0
+              step: 0.05
+
+        release_hours_before_sunset:
+          name: Release before sunset
+          description: >
+            Latest point the battery is allowed to stay held. Guarantees it
+            still fills on days the forecast called wrong.
+          default: 3.0
+          selector:
+            number:
+              min: 0.5
+              max: 8.0
+              step: 0.5
+              unit_of_measurement: hours
+
+        sustained_minutes:
+          name: Clipping must persist for
+          description: >
+            How long export must sit at the ceiling before the battery is
+            released. Filters out brief spikes. Keep this short: on a broken
+            cloud day export dips below the ceiling constantly, and a long
+            window may never be reached.
+          default: 3
+          selector:
+            number:
+              min: 1
+              max: 30
+              step: 1
+              unit_of_measurement: minutes
+
+        min_open_minutes:
+          name: Minimum time held open
+          description: >
+            Once released, stay released at least this long.
+
+
+            Without it, a cloud gap during the clipping window looks like
+            "clipping stopped" and the battery is held again mid-burst, cutting
+            off capture after a few minutes. On a modelled broken-cloud day
+            this was the difference between 2 writes and 8.
+          default: 45
+          selector:
+            number:
+              min: 0
+              max: 180
+              step: 5
+              unit_of_measurement: minutes
+
+        headroom_floor:
+          name: Stop protecting below
+          description: >
+            Once less than this much room remains, leave the limit open. Avoids
+            pointless writes chasing the last fraction of a kWh.
+          default: 2.0
+          selector:
+            number:
+              min: 0.0
+              max: 10.0
+              step: 0.5
+              unit_of_measurement: kWh
+
+        write_deadband:
+          name: Write deadband
+          description: >
+            Only write when the target moves at least this far. Each write
+            resets the guard's own 5% hysteresis latch, so needless writes are
+            not free.
+          default: 4
+          selector:
+            number:
+              min: 1
+              max: 20
+              step: 1
+
+mode: single
+max_exceeded: silent
+
+# The clipping trigger needs the select before the automation body runs.
+trigger_variables:
+  t_select: !input battery_mode_select
+
+triggers:
+  - trigger: time_pattern
+    minutes: "/15"
+
+  - trigger: homeassistant
+    event: start
+
+  # Export sitting at the ceiling means DC power is being curtailed right now.
+  # No forecast involved, so this is right even on days Solcast called wrong.
+  - trigger: template
+    value_template: >
+      {% set cap = state_attr(t_select, 'feed_in_power_max') | float(0) %}
+      {% set out = -(state_attr(t_select, 'grid_power') | float(0)) %}
+      {{ cap > 0 and out >= cap * 0.97 }}
+    for:
+      minutes: !input sustained_minutes
+
+variables:
+  sel: !input battery_mode_select
+  e_limit: !input charge_limit_number
+  solcast: !input solcast_peak_sensor
+  margin: !input peak_margin
+  release_h: !input release_hours_before_sunset
+  min_open: !input min_open_minutes
+  headroom_floor: !input headroom_floor
+  deadband: !input write_deadband
+
+  # Anything other than these means another automation holds the inverter, or
+  # Modbus Control is off and the guards would not apply anyway. Checked
+  # instead of revert_at, which only appears when a command was given a
+  # duration — a command with only an `until` condition would be invisible.
+  control_ours: >
+    {{ state_attr(sel, 'status') in
+       ['automatic', 'charge_limit_reached', 'reserve_reached'] }}
+
+  cap_w: "{{ state_attr(sel, 'feed_in_power_max') | float(0) }}"
+  soc: "{{ state_attr(sel, 'battery_soc') | float(0) }}"
+  export_w: "{{ -(state_attr(sel, 'grid_power') | float(0)) }}"
+
+  # Read from the number rather than the select attribute: its last_changed is
+  # what the minimum-open damper needs, and an attribute carries no timestamp
+  # of its own.
+  current_limit: "{{ states(e_limit) | float(100) }}"
+  limit_age_min: >
+    {% if states[e_limit] is not none %}
+      {{ ((now() - states[e_limit].last_changed).total_seconds() / 60) | round(1) }}
+    {% else %}
+      999
+    {% endif %}
+
+  capacity_kwh: >
+    {% set wh = state_attr(sel, 'battery_capacity') | float(0) %}
+    {{ (wh / 1000) if wh > 0 else 0 }}
+  headroom_kwh: >
+    {{ (capacity_kwh * (100 - soc) / 100) if capacity_kwh > 0 else 999 }}
+
+  # The whole seasonal test, in one comparison: off all winter, off on dull
+  # days, off on any day the array cannot reach the cap.
+  clip_possible: >
+    {{ cap_w > 0 and (states(solcast) | float(0)) * margin > cap_w }}
+
+  clipping_now: "{{ cap_w > 0 and export_w >= cap_w * 0.97 }}"
+
+  # next_setting rolls to tomorrow once the sun is down, so a sunset test alone
+  # would hold the battery all night and run the house off grid.
+  past_release: >
+    {% set s = state_attr('sun.sun', 'next_setting') | as_datetime %}
+    {{ is_state('sun.sun', 'below_horizon')
+       or (s is not none and now() >= s - timedelta(hours=release_h | float(3))) }}
+
+  holding_open: "{{ current_limit >= 99 and limit_age_min < (min_open | float(45)) }}"
+
+  target_limit: >
+    {% if not clip_possible or clipping_now or past_release
+          or headroom_kwh < (headroom_floor | float(2))
+          or holding_open %}
+      100
+    {% else %}
+      {{ soc | round(0) | int }}
+    {% endif %}
+
+conditions:
+  - condition: template
+    value_template: "{{ control_ours }}"
+  - condition: template
+    value_template: >
+      {{ (target_limit | float(100) - current_limit) | abs >= (deadband | float(4)) }}
+
+actions:
+  - action: number.set_value
+    target:
+      entity_id: "{{ e_limit }}"
+    data:
+      value: "{{ target_limit | int(100) }}"

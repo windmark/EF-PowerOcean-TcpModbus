@@ -54,10 +54,27 @@ class EcoFlowBatteryModeSelect(EcoFlowBaseEntity, SelectEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "status": str(self.coordinator.control.status),
-            "commanded_power": self.coordinator.control.power,
+        """Everything an automation needs to decide, in one place.
+
+        The readings below are duplicated from their own sensors on purpose.
+        An automation that wants them otherwise has to find those sensors by
+        entity id, and entity ids are derived from display names, which are
+        exactly what a user is most likely to rename. Publishing them here
+        makes this entity the contract instead: pick the mode, read the state.
+        """
+        control = self.coordinator.control
+        data = self.coordinator.data or {}
+        attributes: dict[str, Any] = {
+            "status": str(control.status),
+            "commanded_power": control.power,
+            "charge_limit_soc": control.charge_limit_soc,
+            "battery_reserve_soc": control.battery_reserve_soc,
+            "battery_soc": data.get("battery_soc"),
+            "battery_capacity": data.get("battery_capacity"),
+            "grid_power": data.get("grid_power"),
+            "feed_in_power_max": data.get("feed_in_power_max"),
         }
+        return attributes
 
     async def async_select_option(self, option: str) -> None:
         await self.coordinator.control.async_select_feature(ControlFeature(option))
